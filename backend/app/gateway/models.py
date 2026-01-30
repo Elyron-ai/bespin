@@ -1,6 +1,6 @@
 """Database models for the Tool Invocation Gateway."""
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Text, DateTime, UniqueConstraint
+from sqlalchemy import Column, String, Integer, Text, DateTime, Float, Index, UniqueConstraint
 from app.database import Base
 
 
@@ -70,4 +70,37 @@ class IdempotencyKey(Base):
             "tenant_id", "endpoint", "idempotency_key",
             name="uq_idempotency_tenant_endpoint_key"
         ),
+    )
+
+
+class KPIDefinition(Base):
+    """KPI definition scoped to a tenant."""
+    __tablename__ = "kpi_definitions"
+
+    kpi_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    name = Column(String(255), nullable=False)
+    unit = Column(String(50), nullable=True)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_kpi_definitions_tenant_name", "tenant_id", "name"),
+    )
+
+
+class KPIPoint(Base):
+    """Time series data point for a KPI."""
+    __tablename__ = "kpi_points"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(36), nullable=False)
+    kpi_id = Column(String(36), nullable=False)
+    ts = Column(String(30), nullable=False)  # ISO 8601 datetime string
+    value = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "kpi_id", "ts", name="uq_kpi_point_tenant_kpi_ts"),
+        Index("ix_kpi_points_tenant_kpi_ts", "tenant_id", "kpi_id", "ts"),
     )

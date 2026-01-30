@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-from app.gateway.models import AuditLog, UsageEvent
+from app.gateway.models import AuditLog, KPIDefinition, KPIPoint, UsageEvent
 
 
 # Create a test database
@@ -605,3 +605,581 @@ class TestTenantIsolation:
 
         # Different request_ids because different tenants
         assert request_id1 != request_id2
+
+
+# --- KPI Tests ---
+
+
+class TestKPICreateAndIngest:
+    """Tests for KPI creation and point ingestion."""
+
+    def test_admin_can_create_kpi(self, client, tenant, admin_user):
+        """Test that admin can create a KPI definition."""
+        response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP", "description": "Monthly recurring revenue"},
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert "kpi_id" in data
+        assert data["name"] == "MRR"
+        assert data["unit"] == "GBP"
+        assert data["description"] == "Monthly recurring revenue"
+
+    def test_admin_can_bulk_ingest_points(self, client, tenant, admin_user):
+        """Test that admin can bulk ingest KPI points."""
+        # First create a KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        assert kpi_response.status_code == 201
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest points
+        response = client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "points": [
+                    {"ts": "2026-01-01T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-08T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["inserted"] == 2
+        assert data["ignored"] == 0
+
+    def test_bulk_ingest_ignores_duplicates(self, client, tenant, admin_user):
+        """Test that bulk ingest ignores duplicate timestamps."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "DAU", "unit": "users"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # First ingest
+        response1 = client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers=headers,
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 100.0}]},
+        )
+        assert response1.status_code == 200
+        assert response1.json()["inserted"] == 1
+
+        # Second ingest with same timestamp - should be ignored
+        response2 = client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers=headers,
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 200.0}]},
+        )
+        assert response2.status_code == 200
+        assert response2.json()["inserted"] == 0
+        assert response2.json()["ignored"] == 1
+
+
+class TestKPIRBAC:
+    """Tests for KPI RBAC (member can read, cannot write)."""
+
+    def test_member_cannot_create_kpi(self, client, tenant, member_user):
+        """Test that member cannot create KPI definitions - returns 403."""
+        response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        assert response.status_code == 403
+        assert "not authorized to create KPIs" in response.json()["detail"]
+
+    def test_member_cannot_ingest_points(self, client, tenant, admin_user, member_user):
+        """Test that member cannot ingest KPI points - returns 403."""
+        # Create KPI as admin
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Try to ingest as member
+        response = client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 1000.0}]},
+        )
+        assert response.status_code == 403
+        assert "not authorized to ingest KPI points" in response.json()["detail"]
+
+    def test_member_can_list_kpis(self, client, tenant, admin_user, member_user):
+        """Test that member can list KPI definitions."""
+        # Create KPI as admin
+        client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+
+        # List as member
+        response = client.get(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "MRR"
+
+    def test_member_can_get_latest(self, client, tenant, admin_user, member_user):
+        """Test that member can get latest KPI point."""
+        # Create KPI and ingest points as admin
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "points": [
+                    {"ts": "2026-01-01T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-08T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+
+        # Get latest as member
+        response = client.get(
+            f"/v1/kpis/{kpi_id}/latest",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["kpi_id"] == kpi_id
+        assert data["ts"] == "2026-01-08T00:00:00Z"
+        assert data["value"] == 1250.0
+
+
+class TestKPITenantIsolation:
+    """Tests for KPI tenant isolation."""
+
+    def test_tenant_cannot_see_other_tenant_kpis(self, client, tenant, admin_user, other_tenant, other_tenant_user):
+        """Test that tenant A cannot see tenant B's KPIs."""
+        # Create KPI for tenant A
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Secret KPI", "unit": "units"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Tenant B tries to list KPIs - should only see their own (none)
+        response = client.get(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_tenant_cannot_access_other_tenant_kpi_by_id(self, client, tenant, admin_user, other_tenant, other_tenant_user):
+        """Test that tenant B cannot access tenant A's KPI by ID (returns 404)."""
+        # Create KPI for tenant A
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Secret KPI", "unit": "units"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Tenant B tries to get latest for tenant A's KPI - should get 404
+        response = client.get(
+            f"/v1/kpis/{kpi_id}/latest",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404
+        assert "not found" in response.json()["detail"]
+
+    def test_tenant_cannot_ingest_to_other_tenant_kpi(self, client, tenant, admin_user, other_tenant, other_tenant_user):
+        """Test that tenant B cannot ingest points to tenant A's KPI."""
+        # Create KPI for tenant A
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Secret KPI", "unit": "units"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Tenant B tries to ingest to tenant A's KPI - should get 404
+        response = client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 9999.0}]},
+        )
+        assert response.status_code == 404
+
+
+class TestKPISummaryTool:
+    """Tests for the kpi_summary tool."""
+
+    def test_kpi_summary_correct_delta_calculation(self, client, tenant, admin_user):
+        """Test that kpi_summary computes correct delta_abs and delta_pct."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest points: start=1000, latest=1250 (25% increase)
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "points": [
+                    {"ts": "2026-01-01T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-08T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+
+        # Invoke kpi_summary tool with window_days=7
+        response = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "kpi-summary-test-1",
+            },
+            json={
+                "tool_name": "kpi_summary",
+                "payload": {"kpi_id": kpi_id, "window_days": 7},
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()["result"]
+
+        assert result["kpi_id"] == kpi_id
+        assert result["latest"]["ts"] == "2026-01-08T00:00:00Z"
+        assert result["latest"]["value"] == 1250.0
+        assert result["start"]["ts"] == "2026-01-01T00:00:00Z"
+        assert result["start"]["value"] == 1000.0
+        assert result["delta_abs"] == 250.0
+        assert result["delta_pct"] == 25.0
+
+    def test_kpi_summary_single_point_in_window(self, client, tenant, admin_user):
+        """Test kpi_summary with only one point in window (delta=0)."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "DAU", "unit": "users"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest only one point
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-08T00:00:00Z", "value": 500.0}]},
+        )
+
+        # Invoke kpi_summary
+        response = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "kpi-summary-single-point",
+            },
+            json={
+                "tool_name": "kpi_summary",
+                "payload": {"kpi_id": kpi_id, "window_days": 7},
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()["result"]
+
+        # With only one point, start == latest and delta == 0
+        assert result["latest"]["value"] == 500.0
+        assert result["start"]["value"] == 500.0
+        assert result["delta_abs"] == 0.0
+        assert result["delta_pct"] == 0.0
+
+    def test_kpi_summary_creates_audit_and_usage(self, client, tenant, admin_user):
+        """Test that kpi_summary creates exactly one audit_log and one usage_event."""
+        # Create KPI and ingest points
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Test KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 100.0}]},
+        )
+
+        # Invoke kpi_summary
+        response = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "audit-usage-test",
+            },
+            json={
+                "tool_name": "kpi_summary",
+                "payload": {"kpi_id": kpi_id, "window_days": 7},
+            },
+        )
+        assert response.status_code == 200
+        request_id = response.json()["request_id"]
+
+        # Verify audit log
+        db = TestingSessionLocal()
+        try:
+            audit_logs = db.query(AuditLog).filter(
+                AuditLog.request_id == request_id
+            ).all()
+            assert len(audit_logs) == 1
+            assert audit_logs[0].tool_name == "kpi_summary"
+
+            # Verify usage event
+            usage_events = db.query(UsageEvent).filter(
+                UsageEvent.request_id == request_id
+            ).all()
+            assert len(usage_events) == 1
+            assert usage_events[0].tool_name == "kpi_summary"
+        finally:
+            db.close()
+
+    def test_kpi_summary_idempotent_replay_no_duplicate_logs(self, client, tenant, admin_user):
+        """Test that idempotent replay of kpi_summary does NOT create more audit/usage logs."""
+        # Create KPI and ingest points
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Idempotent Test KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-01T00:00:00Z", "value": 100.0}]},
+        )
+
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "idempotent-kpi-summary-key",
+        }
+        body = {
+            "tool_name": "kpi_summary",
+            "payload": {"kpi_id": kpi_id, "window_days": 7},
+        }
+
+        # First request
+        response1 = client.post("/v1/tools/invoke", headers=headers, json=body)
+        assert response1.status_code == 200
+        request_id1 = response1.json()["request_id"]
+
+        # Second identical request (idempotent replay)
+        response2 = client.post("/v1/tools/invoke", headers=headers, json=body)
+        assert response2.status_code == 200
+        request_id2 = response2.json()["request_id"]
+
+        # Same request_id
+        assert request_id1 == request_id2
+
+        # Only one audit log and one usage event
+        db = TestingSessionLocal()
+        try:
+            audit_logs = db.query(AuditLog).filter(
+                AuditLog.request_id == request_id1
+            ).all()
+            assert len(audit_logs) == 1
+
+            usage_events = db.query(UsageEvent).filter(
+                UsageEvent.request_id == request_id1
+            ).all()
+            assert len(usage_events) == 1
+        finally:
+            db.close()
+
+    def test_kpi_summary_zero_start_value_null_pct(self, client, tenant, admin_user):
+        """Test that delta_pct is null when start value is 0."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Zero Start KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest points with start=0
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "points": [
+                    {"ts": "2026-01-01T00:00:00Z", "value": 0.0},
+                    {"ts": "2026-01-08T00:00:00Z", "value": 100.0},
+                ]
+            },
+        )
+
+        # Invoke kpi_summary
+        response = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "zero-start-test",
+            },
+            json={
+                "tool_name": "kpi_summary",
+                "payload": {"kpi_id": kpi_id, "window_days": 7},
+            },
+        )
+        assert response.status_code == 200
+        result = response.json()["result"]
+
+        assert result["start"]["value"] == 0.0
+        assert result["latest"]["value"] == 100.0
+        assert result["delta_abs"] == 100.0
+        assert result["delta_pct"] is None  # Division by zero protection

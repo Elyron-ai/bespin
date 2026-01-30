@@ -11,6 +11,7 @@ This gateway proves the following core capabilities:
 3. **Audit Logging**: Every tool invocation writes an audit log record
 4. **Usage Metering**: Every tool invocation emits a usage/metering event
 5. **Idempotency**: Prevents double-charging/double-logging on retries
+6. **KPI Store**: Canonical data model for KPIs with time series ingestion and querying
 
 ## Tech Stack
 
@@ -53,10 +54,17 @@ The server will be available at `http://localhost:8000`.
 cd backend
 
 # Using pytest directly
-pytest tests/test_tools_invoke.py -v
+PYTHONPATH=. pytest tests/test_tools_invoke.py -v
 
 # Or using poetry
 poetry run pytest tests/test_tools_invoke.py -v
+```
+
+## Run Smoke Test
+
+```bash
+# Start server first, then in another terminal:
+./scripts/smoke_phase0.sh
 ```
 
 ## API Endpoints
@@ -88,6 +96,40 @@ Required Headers:
 - `X-User-ID`: User UUID
 - `X-API-Key`: Tenant API key
 - `Idempotency-Key`: Unique key for idempotent requests
+
+Available tools: `echo`, `kpi_summary`
+
+### 4. Create KPI Definition (Admin Only)
+
+```
+POST /v1/kpis
+```
+
+Required Headers: `X-Tenant-ID`, `X-User-ID`, `X-API-Key`
+
+### 5. Bulk Ingest KPI Points (Admin Only)
+
+```
+POST /v1/kpis/{kpi_id}/points:bulk
+```
+
+Required Headers: `X-Tenant-ID`, `X-User-ID`, `X-API-Key`
+
+### 6. List KPI Definitions (Admin & Member)
+
+```
+GET /v1/kpis
+```
+
+Required Headers: `X-Tenant-ID`, `X-User-ID`, `X-API-Key`
+
+### 7. Get Latest KPI Point (Admin & Member)
+
+```
+GET /v1/kpis/{kpi_id}/latest
+```
+
+Required Headers: `X-Tenant-ID`, `X-User-ID`, `X-API-Key`
 
 ## Example curl Sequence
 
@@ -157,6 +199,83 @@ Response:
 }
 ```
 
+### 4. Create a KPI Definition
+
+```bash
+curl -X POST http://localhost:8000/v1/kpis \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-User-ID: 660e8400-e29b-41d4-a716-446655440001" \
+  -H "X-API-Key: abc123xyz..." \
+  -d '{"name": "MRR", "unit": "GBP", "description": "Monthly recurring revenue"}'
+```
+
+Response:
+```json
+{
+  "kpi_id": "880e8400-e29b-41d4-a716-446655440003",
+  "name": "MRR",
+  "unit": "GBP",
+  "description": "Monthly recurring revenue"
+}
+```
+
+### 5. Bulk Ingest KPI Points
+
+```bash
+curl -X POST http://localhost:8000/v1/kpis/880e8400-e29b-41d4-a716-446655440003/points:bulk \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-User-ID: 660e8400-e29b-41d4-a716-446655440001" \
+  -H "X-API-Key: abc123xyz..." \
+  -d '{
+    "points": [
+      {"ts": "2026-01-01T00:00:00Z", "value": 1000.0},
+      {"ts": "2026-01-08T00:00:00Z", "value": 1250.0}
+    ]
+  }'
+```
+
+Response:
+```json
+{
+  "inserted": 2,
+  "ignored": 0
+}
+```
+
+### 6. Invoke kpi_summary Tool
+
+```bash
+curl -X POST http://localhost:8000/v1/tools/invoke \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: 550e8400-e29b-41d4-a716-446655440000" \
+  -H "X-User-ID: 660e8400-e29b-41d4-a716-446655440001" \
+  -H "X-API-Key: abc123xyz..." \
+  -H "Idempotency-Key: kpi-summary-request-1" \
+  -d '{
+    "tool_name": "kpi_summary",
+    "payload": {
+      "kpi_id": "880e8400-e29b-41d4-a716-446655440003",
+      "window_days": 7
+    }
+  }'
+```
+
+Response:
+```json
+{
+  "request_id": "990e8400-e29b-41d4-a716-446655440004",
+  "result": {
+    "kpi_id": "880e8400-e29b-41d4-a716-446655440003",
+    "latest": {"ts": "2026-01-08T00:00:00Z", "value": 1250.0},
+    "start": {"ts": "2026-01-01T00:00:00Z", "value": 1000.0},
+    "delta_abs": 250.0,
+    "delta_pct": 25.0
+  }
+}
+```
+
 ## Data Model
 
 ### Tables
@@ -166,12 +285,14 @@ Response:
 - **audit_logs**: Immutable log of all tool invocations
 - **usage_events**: Metering events for billing/analytics
 - **idempotency_keys**: Prevents duplicate processing
+- **kpi_definitions**: KPI definitions scoped to tenants (name, unit, description)
+- **kpi_points**: Time series data points for KPIs (tenant_id, kpi_id, ts, value)
 
 ### RBAC
 
 Currently implemented roles:
-- **admin**: Can invoke tools
-- **member**: Cannot invoke tools (future: read-only access)
+- **admin**: Can invoke tools, create KPI definitions, ingest KPI points
+- **member**: Can read KPIs (list definitions, get latest point)
 
 ## Error Responses
 

@@ -11,12 +11,14 @@ class Role(str, Enum):
 class Permission(str, Enum):
     """Available permissions."""
     INVOKE_TOOLS = "invoke_tools"
+    KPI_WRITE = "kpi_write"  # Create KPI definitions, ingest points
+    KPI_READ = "kpi_read"    # Read KPI definitions and points
 
 
 # Role to permissions mapping
 ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
-    Role.ADMIN: {Permission.INVOKE_TOOLS},
-    Role.MEMBER: set(),  # Members cannot invoke tools for now
+    Role.ADMIN: {Permission.INVOKE_TOOLS, Permission.KPI_WRITE, Permission.KPI_READ},
+    Role.MEMBER: {Permission.KPI_READ},  # Members can read KPIs but not write
 }
 
 
@@ -47,3 +49,27 @@ def can_invoke_tools(role: str) -> bool:
         True if the role can invoke tools, False otherwise.
     """
     return has_permission(role, Permission.INVOKE_TOOLS)
+
+
+def can_write_kpis(role: str) -> bool:
+    """Check if a role can create KPI definitions and ingest points.
+
+    Args:
+        role: The user's role as a string.
+
+    Returns:
+        True if the role can write KPIs, False otherwise.
+    """
+    return has_permission(role, Permission.KPI_WRITE)
+
+
+def can_read_kpis(role: str) -> bool:
+    """Check if a role can read KPI definitions and points.
+
+    Args:
+        role: The user's role as a string.
+
+    Returns:
+        True if the role can read KPIs, False otherwise.
+    """
+    return has_permission(role, Permission.KPI_READ)
