@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "app"
 version = "0.1.0"
-description = ""
+description = "Bespin Tool Invocation Gateway - Phase 0"
 authors = ["Devin AI <158243242+devin-ai-integration[bot]@users.noreply.github.com>"]
 readme = "README.md"
 
@@ -10,9 +10,6 @@ python = "^3.12"
 fastapi = {extras = ["standard"], version = "^0.116.1"}
 psycopg = {extras = ["binary"], version = "^3.2.9"}
 sqlalchemy = "^2.0.42"
-stripe = "^12.3.0"
-python-jose = {extras = ["cryptography"], version = "^3.5.0"}
-passlib = {extras = ["bcrypt"], version = "^1.7.4"}
 python-dotenv = "^1.1.1"
 
 [tool.poetry.group.dev.dependencies]
