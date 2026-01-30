@@ -1,114 +1,78 @@
-# Bespin - Stripe Subscription System
+# Bespin - Tool Invocation Gateway (Phase 0)
 
-A complete subscription management system built with FastAPI and React, featuring Stripe integration for payment processing.
+A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 
-## Features
+## Phase 0 Deliverables
 
-- User authentication with JWT tokens
-- Stripe subscription management
-- Webhook handling for subscription events
-- React frontend with shadcn/ui components
-- Real-time subscription status updates
+### Item 1: Tool Invocation Gateway
+- Multi-tenant architecture with complete isolation
+- API key authentication with tenant context
+- Role-based access control (admin, member)
+- Audit logging for every tool invocation
+- Usage metering for billing/analytics
+- Idempotency support for retry safety
 
-## Backend Setup
+### Item 2: KPI Store + Ingestion API
+- Canonical data model for KPIs (definitions + time series points)
+- Bulk ingestion API for time series data
+- `kpi_summary` tool for context-aware data analysis
 
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
+## Quick Start
 
-2. Install dependencies:
-   ```bash
-   poetry install
-   ```
-
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your Stripe keys
-   ```
-
-4. Run the development server:
-   ```bash
-   poetry run fastapi dev app/main.py
-   ```
-
-## Frontend Setup
-
-1. Navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Set up environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env with your API URL and Stripe publishable key
-   ```
-
-4. Run the development server:
-   ```bash
-   npm run dev
-   ```
-
-## API Endpoints
-
-- `POST /api/auth/register` - User registration
-- `POST /api/auth/login` - User login
-- `GET /api/auth/me` - Get current user info
-- `POST /api/subscribe` - Create subscription checkout session
-- `GET /api/subscription/status` - Get subscription status
-- `POST /api/stripe/webhook` - Stripe webhook handler
-
-## Environment Variables
-
-### Backend (.env)
-```
-SECRET_KEY=your-jwt-secret-key
-STRIPE_PUBLISHABLE_KEY=pk_test_...
-STRIPE_SECRET_KEY=sk_test_...
-STRIPE_WEBHOOK_SECRET=whsec_...
-```
-
-### Frontend (.env)
-```
-VITE_API_URL=http://localhost:8000
-VITE_STRIPE_PUBLISHABLE_KEY=pk_test_...
-```
-
-## Testing
-
-1. Start both backend and frontend servers
-2. Register a new user account
-3. Navigate to subscription page
-4. Test the complete checkout flow
-5. Verify webhook processing with Stripe CLI
-
-## Stripe Webhook Events
-
-The system handles these Stripe webhook events:
-- `checkout.session.completed`
-- `invoice.paid`
-- `customer.subscription.created`
-- `customer.subscription.updated`
-- `customer.subscription.deleted`
-
-## Database Schema
-
-The User model includes these subscription-related fields:
-- `stripe_customer_id` - Stripe customer ID
-- `subscription_status` - Current subscription status (active/canceled/expired)
-- `subscription_id` - Stripe subscription ID
-- `current_period_end` - End date of current billing period
-
-## Development
-This project uses pre-commit hooks for code quality. To set up:
 ```bash
-pip install pre-commit
-pre-commit install
+cd backend
+
+# Install dependencies
+poetry install
+
+# Run the server
+poetry run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# Run tests
+poetry run pytest tests/test_tools_invoke.py -v
+
+# Run smoke test (server must be running)
+./scripts/smoke_phase0.sh
+```
+
+## API Overview
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/tenants` | Create tenant (open) |
+| `POST /v1/users` | Create user |
+| `POST /v1/tools/invoke` | Invoke tool (admin only) |
+| `POST /v1/kpis` | Create KPI definition (admin only) |
+| `POST /v1/kpis/{kpi_id}/points:bulk` | Bulk ingest KPI points (admin only) |
+| `GET /v1/kpis` | List KPI definitions |
+| `GET /v1/kpis/{kpi_id}/latest` | Get latest KPI point |
+
+See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
+
+## Tech Stack
+
+- Python 3.12+
+- FastAPI + Uvicorn
+- SQLAlchemy + SQLite
+- pytest + httpx
+
+## Project Structure
+
+```
+bespin/
+├── backend/
+│   ├── app/
+│   │   ├── main.py              # FastAPI app
+│   │   ├── database.py          # SQLAlchemy setup
+│   │   └── gateway/             # Phase 0 implementation
+│   │       ├── router.py        # API endpoints
+│   │       ├── models.py        # Data models
+│   │       ├── schemas.py       # Request/response schemas
+│   │       ├── tools.py         # Tool registry
+│   │       ├── rbac.py          # Access control
+│   │       └── idempotency.py   # Idempotency handling
+│   └── tests/
+│       └── test_tools_invoke.py # Comprehensive test suite
+└── scripts/
+    └── smoke_phase0.sh          # End-to-end smoke test
 ```
