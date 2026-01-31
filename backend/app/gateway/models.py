@@ -123,3 +123,38 @@ class Brief(Base):
         UniqueConstraint("tenant_id", "brief_date", name="uq_brief_tenant_date"),
         Index("ix_briefs_tenant_date", "tenant_id", "brief_date"),
     )
+
+
+class NotificationPref(Base):
+    """User notification preferences scoped to a tenant."""
+    __tablename__ = "notification_prefs"
+
+    tenant_id = Column(String(36), nullable=False, primary_key=True)
+    user_id = Column(String(36), nullable=False, primary_key=True)
+    daily_brief_enabled = Column(Integer, nullable=False, default=1)  # 0 or 1
+    delivery_method = Column(String(50), nullable=False, default="in_app")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class NotificationOutbox(Base):
+    """Notification outbox for queued notifications."""
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
+    notification_type = Column(String(50), nullable=False)  # e.g. "daily_brief"
+    notif_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    status = Column(String(20), nullable=False)  # "queued" | "acked"
+    payload_json = Column(Text, nullable=False)  # JSON string
+    request_id = Column(String(36), nullable=False)  # UUID correlation
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "user_id", "notification_type", "notif_date",
+            name="uq_notification_tenant_user_type_date"
+        ),
+        Index("ix_notification_outbox_tenant_user_date", "tenant_id", "user_id", "notif_date"),
+    )

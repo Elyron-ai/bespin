@@ -7,7 +7,15 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-from app.gateway.models import AuditLog, Brief, KPIDefinition, KPIPoint, UsageEvent
+from app.gateway.models import (
+    AuditLog,
+    Brief,
+    KPIDefinition,
+    KPIPoint,
+    NotificationOutbox,
+    NotificationPref,
+    UsageEvent,
+)
 
 
 # Create a test database
@@ -1958,3 +1966,501 @@ class TestBriefNotFound:
             },
         )
         assert response.status_code == 404
+
+
+# =====================================
+# Item #4: Notifications v0 + Daily Brief Runner
+# =====================================
+
+
+class TestNotificationPrefsDefaults:
+    """Tests for notification preferences default behavior."""
+
+    def test_default_prefs_returned_if_none_exist(self, client, tenant, member_user):
+        """Test that default prefs are returned if none have been saved."""
+        response = client.get(
+            "/v1/notifications/prefs",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["daily_brief_enabled"] is True
+        assert data["delivery_method"] == "in_app"
+
+
+class TestNotificationPrefsUpdate:
+    """Tests for updating notification preferences."""
+
+    def test_put_prefs_saves_and_get_returns_updated(self, client, tenant, member_user):
+        """Test that PUT prefs saves and GET returns updated values."""
+        # Update prefs
+        put_response = client.put(
+            "/v1/notifications/prefs",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"daily_brief_enabled": False, "delivery_method": "in_app"},
+        )
+        assert put_response.status_code == 200
+        put_data = put_response.json()
+        assert put_data["daily_brief_enabled"] is False
+        assert put_data["delivery_method"] == "in_app"
+
+        # Get prefs to verify
+        get_response = client.get(
+            "/v1/notifications/prefs",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert get_response.status_code == 200
+        get_data = get_response.json()
+        assert get_data["daily_brief_enabled"] is False
+
+    def test_put_prefs_updates_existing(self, client, tenant, member_user):
+        """Test that PUT prefs updates existing preferences."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # First update
+        client.put(
+            "/v1/notifications/prefs",
+            headers=headers,
+            json={"daily_brief_enabled": False, "delivery_method": "in_app"},
+        )
+
+        # Second update
+        response = client.put(
+            "/v1/notifications/prefs",
+            headers=headers,
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+        assert response.status_code == 200
+        assert response.json()["daily_brief_enabled"] is True
+
+
+class TestNotificationOutboxIsolation:
+    """Tests for notification outbox tenant/user isolation."""
+
+    def test_user_can_only_list_own_notifications(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test that users can only list their own notifications."""
+        headers_admin = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+        headers_member = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Admin sets prefs to enable notifications
+        client.put(
+            "/v1/notifications/prefs",
+            headers=headers_admin,
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+        # Member sets prefs to enable notifications
+        client.put(
+            "/v1/notifications/prefs",
+            headers=headers_member,
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+
+        # Run the daily brief job as admin
+        response = client.post(
+            "/v1/jobs/daily-brief",
+            headers={**headers_admin, "Idempotency-Key": "test-isolation-1"},
+            json={"date": "2026-01-15"},
+        )
+        assert response.status_code == 200
+        # Should create notifications for both admin and member
+        assert response.json()["notifications_inserted"] >= 2
+
+        # Admin lists their outbox - should see only their notification
+        admin_outbox = client.get(
+            "/v1/notifications/outbox",
+            headers=headers_admin,
+            params={"date": "2026-01-15"},
+        )
+        assert admin_outbox.status_code == 200
+        admin_items = admin_outbox.json()["items"]
+        assert len(admin_items) == 1
+        assert all(item["notification_type"] == "daily_brief" for item in admin_items)
+
+        # Member lists their outbox - should see only their notification
+        member_outbox = client.get(
+            "/v1/notifications/outbox",
+            headers=headers_member,
+            params={"date": "2026-01-15"},
+        )
+        assert member_outbox.status_code == 200
+        member_items = member_outbox.json()["items"]
+        assert len(member_items) == 1
+
+
+class TestDailyBriefRunner:
+    """Tests for the daily brief runner endpoint."""
+
+    def test_admin_can_run_job_creates_brief_and_notifications(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test that admin can run job and it creates brief and notifications."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "test-runner-1",
+        }
+
+        # Enable notifications for both users
+        for user in [admin_user, member_user]:
+            client.put(
+                "/v1/notifications/prefs",
+                headers={
+                    "X-Tenant-ID": tenant["tenant_id"],
+                    "X-User-ID": user["user_id"],
+                    "X-API-Key": tenant["api_key"],
+                },
+                json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+            )
+
+        # Run the job
+        response = client.post(
+            "/v1/jobs/daily-brief",
+            headers=headers,
+            json={"date": "2026-01-20", "window_days": 7, "top_n": 3},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        assert data["date"] == "2026-01-20"
+        assert "brief_id" in data
+        assert data["brief_created"] is True
+        # Should insert notifications for both admin and member
+        assert data["notifications_inserted"] == 2
+        assert data["notifications_ignored"] == 0
+
+    def test_runner_reuses_existing_brief(self, client, tenant, admin_user):
+        """Test that runner reuses existing brief if one exists for the date."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # First, create a brief via the materialize endpoint
+        materialize_response = client.post(
+            "/v1/briefs/materialize",
+            headers={**headers, "Idempotency-Key": "materialize-first"},
+            json={"date": "2026-01-21"},
+        )
+        assert materialize_response.status_code == 200
+        original_brief_id = materialize_response.json()["brief_id"]
+
+        # Enable notifications
+        client.put(
+            "/v1/notifications/prefs",
+            headers=headers,
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+
+        # Run the runner for the same date
+        runner_response = client.post(
+            "/v1/jobs/daily-brief",
+            headers={**headers, "Idempotency-Key": "runner-second"},
+            json={"date": "2026-01-21"},
+        )
+        assert runner_response.status_code == 200
+        data = runner_response.json()
+
+        # Should reuse the existing brief
+        assert data["brief_id"] == original_brief_id
+        assert data["brief_created"] is False
+
+
+class TestDailyBriefRunnerIdempotency:
+    """Tests for runner idempotency."""
+
+    def test_same_key_same_body_returns_same_response(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test idempotent replay returns same response without duplicates."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "idempotent-test-1",
+        }
+
+        # Enable notifications
+        for user in [admin_user, member_user]:
+            client.put(
+                "/v1/notifications/prefs",
+                headers={
+                    "X-Tenant-ID": tenant["tenant_id"],
+                    "X-User-ID": user["user_id"],
+                    "X-API-Key": tenant["api_key"],
+                },
+                json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+            )
+
+        # First request
+        response1 = client.post(
+            "/v1/jobs/daily-brief",
+            headers=headers,
+            json={"date": "2026-01-22"},
+        )
+        assert response1.status_code == 200
+        data1 = response1.json()
+        assert data1["notifications_inserted"] == 2
+
+        # Second request with same idempotency key
+        response2 = client.post(
+            "/v1/jobs/daily-brief",
+            headers=headers,
+            json={"date": "2026-01-22"},
+        )
+        assert response2.status_code == 200
+        data2 = response2.json()
+
+        # Should return same response
+        assert data1["brief_id"] == data2["brief_id"]
+        assert data1["notifications_inserted"] == data2["notifications_inserted"]
+
+        # Verify no additional outbox rows were created
+        member_outbox = client.get(
+            "/v1/notifications/outbox",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            params={"date": "2026-01-22"},
+        )
+        # Should only have 1 notification for this date
+        assert len(member_outbox.json()["items"]) == 1
+
+    def test_same_key_different_body_returns_409(self, client, tenant, admin_user):
+        """Test that same idempotency key with different body returns 409."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "conflict-test-1",
+        }
+
+        # First request
+        response1 = client.post(
+            "/v1/jobs/daily-brief",
+            headers=headers,
+            json={"date": "2026-01-23"},
+        )
+        assert response1.status_code == 200
+
+        # Second request with different body
+        response2 = client.post(
+            "/v1/jobs/daily-brief",
+            headers=headers,
+            json={"date": "2026-01-24"},  # Different date
+        )
+        assert response2.status_code == 409
+
+
+class TestDailyBriefRunnerRBAC:
+    """Tests for runner RBAC."""
+
+    def test_member_cannot_run_job(self, client, tenant, member_user):
+        """Test that member cannot call the daily brief runner (403)."""
+        response = client.post(
+            "/v1/jobs/daily-brief",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "member-attempt-1",
+            },
+            json={"date": "2026-01-25"},
+        )
+        assert response.status_code == 403
+        assert "not authorized" in response.json()["detail"]
+
+
+class TestNotificationAck:
+    """Tests for notification acknowledgment."""
+
+    def test_user_can_ack_own_notification(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test that a user can acknowledge their own notification."""
+        # Enable notifications for member
+        client.put(
+            "/v1/notifications/prefs",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+
+        # Run job as admin
+        client.post(
+            "/v1/jobs/daily-brief",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "ack-test-1",
+            },
+            json={"date": "2026-01-26"},
+        )
+
+        # Member gets their notification
+        outbox = client.get(
+            "/v1/notifications/outbox",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            params={"date": "2026-01-26"},
+        )
+        items = outbox.json()["items"]
+        assert len(items) == 1
+        notif_id = items[0]["id"]
+        assert items[0]["status"] == "queued"
+
+        # Member acks the notification
+        ack_response = client.post(
+            f"/v1/notifications/{notif_id}/ack",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert ack_response.status_code == 200
+        assert ack_response.json()["status"] == "acked"
+
+    def test_user_cannot_ack_others_notification(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test that a user cannot ack another user's notification."""
+        # Enable notifications for admin only
+        client.put(
+            "/v1/notifications/prefs",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+
+        # Run job as admin
+        client.post(
+            "/v1/jobs/daily-brief",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "ack-test-2",
+            },
+            json={"date": "2026-01-27"},
+        )
+
+        # Admin gets their notification
+        outbox = client.get(
+            "/v1/notifications/outbox",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            params={"date": "2026-01-27"},
+        )
+        notif_id = outbox.json()["items"][0]["id"]
+
+        # Member tries to ack admin's notification
+        ack_response = client.post(
+            f"/v1/notifications/{notif_id}/ack",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert ack_response.status_code == 403
+
+
+class TestNotificationOutboxFilters:
+    """Tests for notification outbox filtering."""
+
+    def test_filter_by_status(self, client, tenant, admin_user, member_user):
+        """Test filtering notifications by status."""
+        headers_member = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Enable notifications for member
+        client.put(
+            "/v1/notifications/prefs",
+            headers=headers_member,
+            json={"daily_brief_enabled": True, "delivery_method": "in_app"},
+        )
+
+        # Run job twice for two different dates
+        for i, date in enumerate(["2026-01-28", "2026-01-29"]):
+            client.post(
+                "/v1/jobs/daily-brief",
+                headers={
+                    "X-Tenant-ID": tenant["tenant_id"],
+                    "X-User-ID": admin_user["user_id"],
+                    "X-API-Key": tenant["api_key"],
+                    "Idempotency-Key": f"filter-test-{i}",
+                },
+                json={"date": date},
+            )
+
+        # Ack one notification
+        outbox = client.get("/v1/notifications/outbox", headers=headers_member)
+        first_notif_id = outbox.json()["items"][0]["id"]
+        client.post(f"/v1/notifications/{first_notif_id}/ack", headers=headers_member)
+
+        # Filter by status=queued
+        queued_response = client.get(
+            "/v1/notifications/outbox",
+            headers=headers_member,
+            params={"status": "queued"},
+        )
+        assert queued_response.status_code == 200
+        queued_items = queued_response.json()["items"]
+        assert all(item["status"] == "queued" for item in queued_items)
+
+        # Filter by status=acked
+        acked_response = client.get(
+            "/v1/notifications/outbox",
+            headers=headers_member,
+            params={"status": "acked"},
+        )
+        assert acked_response.status_code == 200
+        acked_items = acked_response.json()["items"]
+        assert len(acked_items) == 1
+        assert acked_items[0]["status"] == "acked"

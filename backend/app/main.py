@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
 from app.gateway import models as gateway_models  # noqa: F401 - import for table creation
 from app.gateway.router import router as gateway_router
+from app.console.router import router as console_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -17,6 +18,7 @@ app.add_middleware(
 )
 
 app.include_router(gateway_router)
+app.include_router(console_router)
 
 @app.get("/")
 def read_root():
