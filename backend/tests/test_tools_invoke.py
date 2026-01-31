@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
 from app.main import app
-from app.gateway.models import AuditLog, KPIDefinition, KPIPoint, UsageEvent
+from app.gateway.models import AuditLog, Brief, KPIDefinition, KPIPoint, UsageEvent
 
 
 # Create a test database
@@ -1183,3 +1183,778 @@ class TestKPISummaryTool:
         assert result["latest"]["value"] == 100.0
         assert result["delta_abs"] == 100.0
         assert result["delta_pct"] is None  # Division by zero protection
+
+
+# --- Brief Tests ---
+
+
+class TestBriefMaterialize:
+    """Tests for brief materialization endpoint."""
+
+    def test_admin_can_materialize_brief(self, client, tenant, admin_user):
+        """Test that admin can materialize a brief after creating KPI + points."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest points
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+
+        # Materialize brief
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "brief-test-1",
+            },
+            json={"date": "2026-01-31", "window_days": 7, "top_n": 3},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check response structure
+        assert "brief_id" in data
+        assert "request_id" in data
+        assert "content" in data
+        assert data["content"]["date"] == "2026-01-31"
+        assert data["content"]["window_days"] == 7
+        assert data["content"]["top_n"] == 3
+        assert "summary" in data["content"]
+        assert "highlights" in data["content"]
+        assert "alerts" in data["content"]
+
+        # Verify summary counts
+        assert data["content"]["summary"]["kpis_considered"] == 1
+        assert data["content"]["summary"]["kpis_up"] == 1
+        assert data["content"]["summary"]["kpis_down"] == 0
+        assert data["content"]["summary"]["kpis_flat"] == 0
+
+    def test_materialize_creates_audit_and_usage(self, client, tenant, admin_user):
+        """Test that materialize writes exactly 1 audit_log and 1 usage_event."""
+        # Create KPI and points
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "DAU", "unit": "users"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 500.0}]},
+        )
+
+        # Materialize brief
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "audit-usage-brief-test",
+            },
+            json={"date": "2026-01-31"},
+        )
+        assert response.status_code == 200
+        request_id = response.json()["request_id"]
+
+        # Check database
+        db = TestingSessionLocal()
+        try:
+            # Verify exactly 1 audit log
+            audit_logs = db.query(AuditLog).filter(
+                AuditLog.request_id == request_id
+            ).all()
+            assert len(audit_logs) == 1
+            assert audit_logs[0].action == "briefs.materialize"
+            assert audit_logs[0].tool_name == "daily_brief"
+
+            # Verify exactly 1 usage event
+            usage_events = db.query(UsageEvent).filter(
+                UsageEvent.request_id == request_id
+            ).all()
+            assert len(usage_events) == 1
+            assert usage_events[0].activity_type == "daily_brief_generated"
+            assert usage_events[0].tool_name == "daily_brief"
+            assert usage_events[0].units == 1
+        finally:
+            db.close()
+
+
+class TestBriefIdempotency:
+    """Tests for brief materialization idempotency."""
+
+    def test_idempotent_returns_same_brief_id(self, client, tenant, admin_user):
+        """Test that same Idempotency-Key + same body returns same brief_id."""
+        # Create KPI and points
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Revenue"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "idempotent-brief-test",
+        }
+        body = {"date": "2026-01-31", "window_days": 7, "top_n": 3}
+
+        # First request
+        response1 = client.post("/v1/briefs/materialize", headers=headers, json=body)
+        assert response1.status_code == 200
+        brief_id1 = response1.json()["brief_id"]
+
+        # Second identical request
+        response2 = client.post("/v1/briefs/materialize", headers=headers, json=body)
+        assert response2.status_code == 200
+        brief_id2 = response2.json()["brief_id"]
+
+        # Same brief_id
+        assert brief_id1 == brief_id2
+
+    def test_idempotent_no_duplicate_audit_usage(self, client, tenant, admin_user):
+        """Test that idempotent replay does NOT create additional audit/usage rows."""
+        # Create KPI and points
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Sessions"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 200.0}]},
+        )
+
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "no-dup-audit-brief",
+        }
+        body = {"date": "2026-01-31"}
+
+        # First request
+        response1 = client.post("/v1/briefs/materialize", headers=headers, json=body)
+        assert response1.status_code == 200
+        request_id = response1.json()["request_id"]
+
+        # Second identical request (idempotent replay)
+        response2 = client.post("/v1/briefs/materialize", headers=headers, json=body)
+        assert response2.status_code == 200
+
+        # Check only 1 audit log and 1 usage event
+        db = TestingSessionLocal()
+        try:
+            audit_logs = db.query(AuditLog).filter(
+                AuditLog.request_id == request_id
+            ).all()
+            assert len(audit_logs) == 1
+
+            usage_events = db.query(UsageEvent).filter(
+                UsageEvent.request_id == request_id
+            ).all()
+            assert len(usage_events) == 1
+        finally:
+            db.close()
+
+    def test_idempotency_conflict_different_body(self, client, tenant, admin_user):
+        """Test that same Idempotency-Key with different body returns 409."""
+        # Create KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Conflict Test KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+            "Idempotency-Key": "conflict-brief-key",
+        }
+
+        # First request
+        body1 = {"date": "2026-01-31", "window_days": 7}
+        response1 = client.post("/v1/briefs/materialize", headers=headers, json=body1)
+        assert response1.status_code == 200
+
+        # Second request with different body
+        body2 = {"date": "2026-01-31", "window_days": 14}  # Different window_days
+        response2 = client.post("/v1/briefs/materialize", headers=headers, json=body2)
+        assert response2.status_code == 409
+        assert "already used with a different request body" in response2.json()["detail"]
+
+
+class TestBriefRBAC:
+    """Tests for brief RBAC (member cannot materialize, but can read)."""
+
+    def test_member_cannot_materialize(self, client, tenant, member_user):
+        """Test that member cannot materialize briefs - returns 403."""
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "member-attempt",
+            },
+            json={"date": "2026-01-31"},
+        )
+        assert response.status_code == 403
+        assert "not authorized to materialize briefs" in response.json()["detail"]
+
+    def test_member_can_get_brief_by_date(self, client, tenant, admin_user, member_user):
+        """Test that member can GET /v1/briefs/{date}."""
+        # Create KPI and points as admin
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Test KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        # Materialize as admin
+        client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "admin-brief",
+            },
+            json={"date": "2026-01-31"},
+        )
+
+        # Fetch as member
+        response = client.get(
+            "/v1/briefs/2026-01-31",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["content"]["date"] == "2026-01-31"
+
+    def test_member_can_get_latest_brief(self, client, tenant, admin_user, member_user):
+        """Test that member can GET /v1/briefs/latest."""
+        # Create KPI and points as admin
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Latest Test KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        # Materialize as admin
+        client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "admin-latest-brief",
+            },
+            json={"date": "2026-01-31"},
+        )
+
+        # Fetch latest as member
+        response = client.get(
+            "/v1/briefs/latest",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["content"]["date"] == "2026-01-31"
+
+
+class TestBriefTenantIsolation:
+    """Tests for brief tenant isolation."""
+
+    def test_tenant_cannot_fetch_other_tenant_brief(
+        self, client, tenant, admin_user, other_tenant, other_tenant_user
+    ):
+        """Test that tenant A cannot fetch tenant B's brief (404)."""
+        # Create KPI for tenant A
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "Tenant A KPI"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        # Materialize brief for tenant A
+        client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "tenant-a-brief",
+            },
+            json={"date": "2026-01-31"},
+        )
+
+        # Tenant B tries to fetch the same date - should get 404
+        response = client.get(
+            "/v1/briefs/2026-01-31",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404
+
+    def test_two_tenants_same_date_independent_briefs(
+        self, client, tenant, admin_user, other_tenant, other_tenant_user
+    ):
+        """Test that two tenants can create briefs for the same date independently."""
+        # Create KPI for tenant A
+        kpi_a = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"name": "KPI A"},
+        ).json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_a}/points:bulk",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 100.0}]},
+        )
+
+        # Create KPI for tenant B
+        kpi_b = client.post(
+            "/v1/kpis",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+            json={"name": "KPI B"},
+        ).json()["kpi_id"]
+
+        client.post(
+            f"/v1/kpis/{kpi_b}/points:bulk",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 200.0}]},
+        )
+
+        # Materialize brief for tenant A
+        response_a = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "tenant-a-iso",
+            },
+            json={"date": "2026-01-31"},
+        )
+        assert response_a.status_code == 200
+        brief_id_a = response_a.json()["brief_id"]
+
+        # Materialize brief for tenant B (same date)
+        response_b = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+                "Idempotency-Key": "tenant-b-iso",
+            },
+            json={"date": "2026-01-31"},
+        )
+        assert response_b.status_code == 200
+        brief_id_b = response_b.json()["brief_id"]
+
+        # Different brief IDs
+        assert brief_id_a != brief_id_b
+
+
+class TestBriefHighlightRanking:
+    """Tests for highlight ranking correctness."""
+
+    def test_highlights_ranked_by_abs_delta_pct(self, client, tenant, admin_user):
+        """Test that highlights are ranked by ABS(delta_pct) descending."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Create 3 KPIs with known deltas
+        # KPI 1: 1000 -> 1100 = +10%
+        kpi1 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "KPI1", "unit": "units"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi1}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 1100.0},
+                ]
+            },
+        )
+
+        # KPI 2: 1000 -> 500 = -50%
+        kpi2 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "KPI2", "unit": "units"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi2}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 500.0},
+                ]
+            },
+        )
+
+        # KPI 3: 1000 -> 1250 = +25%
+        kpi3 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "KPI3", "unit": "units"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi3}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+
+        # Materialize brief with top_n=3
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={**headers, "Idempotency-Key": "ranking-test"},
+            json={"date": "2026-01-31", "window_days": 7, "top_n": 3},
+        )
+        assert response.status_code == 200
+        highlights = response.json()["content"]["highlights"]
+
+        # Order should be: KPI2 (-50%), KPI3 (+25%), KPI1 (+10%)
+        assert len(highlights) == 3
+        assert highlights[0]["name"] == "KPI2"  # abs(-50%) = 50%
+        assert highlights[0]["delta_pct"] == -50.0
+        assert highlights[1]["name"] == "KPI3"  # abs(+25%) = 25%
+        assert highlights[1]["delta_pct"] == 25.0
+        assert highlights[2]["name"] == "KPI1"  # abs(+10%) = 10%
+        assert highlights[2]["delta_pct"] == 10.0
+
+    def test_alerts_for_negative_delta_below_threshold(self, client, tenant, admin_user):
+        """Test that alerts include KPIs with delta_pct <= -10%."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # KPI 1: 1000 -> 850 = -15% (should trigger alert)
+        kpi1 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "Declining KPI"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi1}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 850.0},
+                ]
+            },
+        )
+
+        # KPI 2: 1000 -> 1100 = +10% (no alert)
+        kpi2 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "Growing KPI"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi2}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 1100.0},
+                ]
+            },
+        )
+
+        # Materialize brief
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={**headers, "Idempotency-Key": "alert-test"},
+            json={"date": "2026-01-31", "window_days": 7, "top_n": 5},
+        )
+        assert response.status_code == 200
+        alerts = response.json()["content"]["alerts"]
+
+        # Only the declining KPI should trigger an alert
+        assert len(alerts) == 1
+        assert alerts[0]["name"] == "Declining KPI"
+        assert alerts[0]["severity"] == "high"
+        assert alerts[0]["reason"] == "delta_pct_below_threshold"
+        assert alerts[0]["delta_pct"] == -15.0
+
+    def test_summary_counts_correct(self, client, tenant, admin_user):
+        """Test that summary counts (up/down/flat) are correct."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # KPI 1: +10% (up)
+        kpi1 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "Up KPI"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi1}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 100.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 110.0},
+                ]
+            },
+        )
+
+        # KPI 2: -20% (down)
+        kpi2 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "Down KPI"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi2}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 100.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 80.0},
+                ]
+            },
+        )
+
+        # KPI 3: 0% (flat)
+        kpi3 = client.post(
+            "/v1/kpis", headers=headers, json={"name": "Flat KPI"}
+        ).json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi3}/points:bulk",
+            headers=headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 100.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 100.0},
+                ]
+            },
+        )
+
+        # Materialize brief
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={**headers, "Idempotency-Key": "summary-test"},
+            json={"date": "2026-01-31", "window_days": 7, "top_n": 5},
+        )
+        assert response.status_code == 200
+        summary = response.json()["content"]["summary"]
+
+        assert summary["kpis_considered"] == 3
+        assert summary["kpis_up"] == 1
+        assert summary["kpis_down"] == 1
+        assert summary["kpis_flat"] == 1
+
+
+class TestBriefMissingHeaders:
+    """Tests for missing header validation on brief endpoints."""
+
+    def test_materialize_missing_idempotency_key(self, client, tenant, admin_user):
+        """Test that missing Idempotency-Key returns 400."""
+        response = client.post(
+            "/v1/briefs/materialize",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"date": "2026-01-31"},
+        )
+        assert response.status_code == 400
+        assert "Idempotency-Key" in response.json()["detail"]
+
+    def test_get_brief_missing_tenant_id(self, client):
+        """Test that missing X-Tenant-ID returns 400."""
+        response = client.get(
+            "/v1/briefs/2026-01-31",
+            headers={
+                "X-User-ID": "some-user",
+                "X-API-Key": "some-key",
+            },
+        )
+        assert response.status_code == 400
+        assert "X-Tenant-ID" in response.json()["detail"]
+
+
+class TestBriefNotFound:
+    """Tests for brief not found scenarios."""
+
+    def test_get_brief_not_found(self, client, tenant, admin_user):
+        """Test that fetching non-existent brief returns 404."""
+        response = client.get(
+            "/v1/briefs/2026-12-31",  # No brief for this date
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404
+
+    def test_get_latest_no_briefs(self, client, tenant, admin_user):
+        """Test that fetching latest when no briefs exist returns 404."""
+        response = client.get(
+            "/v1/briefs/latest",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404

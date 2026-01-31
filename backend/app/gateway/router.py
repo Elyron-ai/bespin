@@ -1,6 +1,8 @@
 """API router for the Tool Invocation Gateway."""
+import json
 import secrets
 import uuid
+from datetime import datetime, timezone
 from typing import Annotated
 
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.gateway.briefs import generate_daily_brief
 from app.gateway.idempotency import (
     IdempotencyConflictError,
     check_idempotency,
@@ -16,14 +19,23 @@ from app.gateway.idempotency import (
 )
 from app.gateway.models import (
     AuditLog,
+    Brief,
     GatewayTenant,
     GatewayUser,
     KPIDefinition,
     KPIPoint,
     UsageEvent,
 )
-from app.gateway.rbac import can_invoke_tools, can_read_kpis, can_write_kpis
+from app.gateway.rbac import (
+    can_invoke_tools,
+    can_materialize_briefs,
+    can_read_briefs,
+    can_read_kpis,
+    can_write_kpis,
+)
 from app.gateway.schemas import (
+    BriefMaterializeRequest,
+    BriefResponse,
     KPICreate,
     KPILatestResponse,
     KPIPointsBulkRequest,
@@ -495,4 +507,220 @@ def get_kpi_latest(
         kpi_id=kpi_id,
         ts=latest_point.ts,
         value=latest_point.value,
+    )
+
+
+# --- Brief Endpoints ---
+
+
+@router.post("/briefs/materialize", response_model=BriefResponse, status_code=status.HTTP_200_OK)
+def materialize_brief(
+    request: BriefMaterializeRequest,
+    context_and_key: Annotated[tuple[TenantContext, str], Depends(get_tenant_context)],
+    db: Session = Depends(get_db),
+) -> BriefResponse:
+    """Materialize a daily brief for the tenant.
+
+    Requires admin role. Supports idempotent retries via Idempotency-Key header.
+    """
+    context, idempotency_key = context_and_key
+    endpoint = "/v1/briefs/materialize"
+
+    # Check RBAC: only admins can materialize briefs
+    if not can_materialize_briefs(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to materialize briefs",
+        )
+
+    # Determine brief_date (default to today UTC if not provided)
+    brief_date = request.date
+    if brief_date is None:
+        brief_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Normalize request body for idempotency check
+    request_body = {
+        "date": brief_date,
+        "window_days": request.window_days,
+        "top_n": request.top_n,
+    }
+
+    # Check idempotency
+    try:
+        cached_response = check_idempotency(
+            db=db,
+            tenant_id=context.tenant_id,
+            endpoint=endpoint,
+            idempotency_key=idempotency_key,
+            request_body=request_body,
+        )
+        if cached_response is not None:
+            return BriefResponse(**cached_response)
+    except IdempotencyConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+
+    # Check if brief already exists for this tenant + date
+    existing_brief = db.query(Brief).filter(
+        Brief.tenant_id == context.tenant_id,
+        Brief.brief_date == brief_date,
+    ).first()
+
+    if existing_brief:
+        # Brief exists, return it and store idempotency record
+        content = json.loads(existing_brief.content_json)
+        response = BriefResponse(
+            brief_id=existing_brief.brief_id,
+            request_id=existing_brief.request_id,
+            content=content,
+        )
+        # Store idempotency record (so future calls with same key return same response)
+        store_idempotency(
+            db=db,
+            tenant_id=context.tenant_id,
+            endpoint=endpoint,
+            idempotency_key=idempotency_key,
+            request_body=request_body,
+            response=response.model_dump(),
+        )
+        return response
+
+    # Generate brief content
+    content = generate_daily_brief(
+        db=db,
+        tenant_id=context.tenant_id,
+        brief_date=brief_date,
+        window_days=request.window_days,
+        top_n=request.top_n,
+    )
+
+    # Generate IDs
+    brief_id = str(uuid.uuid4())
+    request_id = str(uuid.uuid4())
+
+    # Create brief record
+    brief = Brief(
+        brief_id=brief_id,
+        tenant_id=context.tenant_id,
+        brief_date=brief_date,
+        window_days=request.window_days,
+        top_n=request.top_n,
+        content_json=json.dumps(content),
+        request_id=request_id,
+    )
+    db.add(brief)
+
+    # Write audit log
+    audit_log = AuditLog(
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        action="briefs.materialize",
+        tool_name="daily_brief",
+        request_id=request_id,
+    )
+    db.add(audit_log)
+
+    # Write usage event
+    usage_event = UsageEvent(
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        activity_type="daily_brief_generated",
+        units=1,
+        tool_name="daily_brief",
+        request_id=request_id,
+    )
+    db.add(usage_event)
+    db.commit()
+
+    # Build response
+    response = BriefResponse(
+        brief_id=brief_id,
+        request_id=request_id,
+        content=content,
+    )
+
+    # Store idempotency record
+    store_idempotency(
+        db=db,
+        tenant_id=context.tenant_id,
+        endpoint=endpoint,
+        idempotency_key=idempotency_key,
+        request_body=request_body,
+        response=response.model_dump(),
+    )
+
+    return response
+
+
+@router.get("/briefs/latest", response_model=BriefResponse)
+def get_latest_brief(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> BriefResponse:
+    """Get the most recent brief for the tenant.
+
+    Requires member or admin role.
+    """
+    # Check RBAC: admin and member can read briefs
+    if not can_read_briefs(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to read briefs",
+        )
+
+    # Get the latest brief by brief_date
+    latest_brief = db.query(Brief).filter(
+        Brief.tenant_id == context.tenant_id
+    ).order_by(Brief.brief_date.desc()).first()
+
+    if not latest_brief:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No briefs found for this tenant",
+        )
+
+    content = json.loads(latest_brief.content_json)
+    return BriefResponse(
+        brief_id=latest_brief.brief_id,
+        request_id=latest_brief.request_id,
+        content=content,
+    )
+
+
+@router.get("/briefs/{date}", response_model=BriefResponse)
+def get_brief_by_date(
+    date: str,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> BriefResponse:
+    """Get a brief by date.
+
+    Requires member or admin role.
+    """
+    # Check RBAC: admin and member can read briefs
+    if not can_read_briefs(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to read briefs",
+        )
+
+    # Fetch brief by tenant_id and date
+    brief = db.query(Brief).filter(
+        Brief.tenant_id == context.tenant_id,
+        Brief.brief_date == date,
+    ).first()
+
+    if not brief:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Brief for date '{date}' not found",
+        )
+
+    content = json.loads(brief.content_json)
+    return BriefResponse(
+        brief_id=brief.brief_id,
+        request_id=brief.request_id,
+        content=content,
     )
