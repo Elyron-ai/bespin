@@ -104,3 +104,62 @@ class KPILatestResponse(BaseModel):
     kpi_id: str
     ts: str
     value: float
+
+
+# Brief schemas
+class BriefMaterializeRequest(BaseModel):
+    """Request schema for materializing a daily brief."""
+    date: str | None = Field(None, description="YYYY-MM-DD, defaults to today UTC")
+    window_days: int = Field(7, ge=1, le=365)
+    top_n: int = Field(3, ge=1, le=100)
+
+
+class BriefPointInfo(BaseModel):
+    """Point info within brief highlights."""
+    ts: str
+    value: float
+
+
+class BriefHighlight(BaseModel):
+    """A KPI highlight in the brief."""
+    kpi_id: str
+    name: str
+    unit: str | None
+    latest: BriefPointInfo
+    start: BriefPointInfo
+    delta_abs: float
+    delta_pct: float | None
+
+
+class BriefAlert(BaseModel):
+    """An alert in the brief."""
+    kpi_id: str
+    name: str
+    severity: str
+    reason: str
+    delta_pct: float
+
+
+class BriefSummary(BaseModel):
+    """Summary section of the brief."""
+    kpis_considered: int
+    kpis_up: int
+    kpis_down: int
+    kpis_flat: int
+
+
+class BriefContent(BaseModel):
+    """Content of a daily brief."""
+    date: str
+    window_days: int
+    top_n: int
+    summary: BriefSummary
+    highlights: list[BriefHighlight]
+    alerts: list[BriefAlert]
+
+
+class BriefResponse(BaseModel):
+    """Response schema for brief operations."""
+    brief_id: str
+    request_id: str
+    content: BriefContent

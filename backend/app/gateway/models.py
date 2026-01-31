@@ -104,3 +104,22 @@ class KPIPoint(Base):
         UniqueConstraint("tenant_id", "kpi_id", "ts", name="uq_kpi_point_tenant_kpi_ts"),
         Index("ix_kpi_points_tenant_kpi_ts", "tenant_id", "kpi_id", "ts"),
     )
+
+
+class Brief(Base):
+    """Daily brief materialized for a tenant."""
+    __tablename__ = "briefs"
+
+    brief_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    brief_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    window_days = Column(Integer, nullable=False)
+    top_n = Column(Integer, nullable=False)
+    content_json = Column(Text, nullable=False)  # JSON string
+    request_id = Column(String(36), nullable=False)  # UUID for audit/usage correlation
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "brief_date", name="uq_brief_tenant_date"),
+        Index("ix_briefs_tenant_date", "tenant_id", "brief_date"),
+    )

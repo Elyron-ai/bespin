@@ -17,6 +17,13 @@ A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 - Bulk ingestion API for time series data
 - `kpi_summary` tool for context-aware data analysis
 
+### Item 3: Insight Materializer (Daily Briefs)
+- Materialize daily briefs per tenant (one per date)
+- Highlights ranked by absolute delta percentage
+- Alerts for KPIs with significant decline (>= 10%)
+- Full idempotency with Idempotency-Key header
+- Audit logging and usage metering for brief generation
+
 ## Quick Start
 
 ```bash
@@ -31,8 +38,9 @@ poetry run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 # Run tests
 poetry run pytest tests/test_tools_invoke.py -v
 
-# Run smoke test (server must be running)
-./scripts/smoke_phase0.sh
+# Run smoke tests (server must be running)
+./scripts/smoke_phase0.sh         # KPI Store smoke test
+./scripts/smoke_phase0_item3.sh   # Daily Briefs smoke test
 ```
 
 ## API Overview
@@ -46,8 +54,53 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `POST /v1/kpis/{kpi_id}/points:bulk` | Bulk ingest KPI points (admin only) |
 | `GET /v1/kpis` | List KPI definitions |
 | `GET /v1/kpis/{kpi_id}/latest` | Get latest KPI point |
+| `POST /v1/briefs/materialize` | Materialize daily brief (admin only, idempotent) |
+| `GET /v1/briefs/{date}` | Get brief by date |
+| `GET /v1/briefs/latest` | Get most recent brief |
 
 See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
+
+## Example: Daily Brief Workflow
+
+```bash
+# 1. Create tenant and admin user (see Quick Start)
+
+# 2. Create a KPI
+curl -X POST http://localhost:8000/v1/kpis \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"name": "MRR", "unit": "GBP"}'
+
+# 3. Ingest KPI points
+curl -X POST "http://localhost:8000/v1/kpis/$KPI_ID/points:bulk" \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "points": [
+      {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+      {"ts": "2026-01-31T00:00:00Z", "value": 1250.0}
+    ]
+  }'
+
+# 4. Materialize a daily brief (idempotent with Idempotency-Key)
+curl -X POST http://localhost:8000/v1/briefs/materialize \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -H "Idempotency-Key: my-unique-key" \
+  -d '{"date": "2026-01-31", "window_days": 7, "top_n": 3}'
+
+# 5. Fetch the brief (any user role)
+curl http://localhost:8000/v1/briefs/2026-01-31 \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $MEMBER_ID" \
+  -H "X-API-Key: $API_KEY"
+```
 
 ## Tech Stack
 
@@ -70,9 +123,11 @@ bespin/
 │   │       ├── schemas.py       # Request/response schemas
 │   │       ├── tools.py         # Tool registry
 │   │       ├── rbac.py          # Access control
-│   │       └── idempotency.py   # Idempotency handling
+│   │       ├── idempotency.py   # Idempotency handling
+│   │       └── briefs.py        # Brief generation logic
 │   └── tests/
 │       └── test_tools_invoke.py # Comprehensive test suite
 └── scripts/
-    └── smoke_phase0.sh          # End-to-end smoke test
+    ├── smoke_phase0.sh          # KPI Store smoke test
+    └── smoke_phase0_item3.sh    # Daily Briefs smoke test
 ```

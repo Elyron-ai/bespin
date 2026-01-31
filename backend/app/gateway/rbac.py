@@ -13,12 +13,20 @@ class Permission(str, Enum):
     INVOKE_TOOLS = "invoke_tools"
     KPI_WRITE = "kpi_write"  # Create KPI definitions, ingest points
     KPI_READ = "kpi_read"    # Read KPI definitions and points
+    BRIEF_MATERIALIZE = "brief_materialize"  # Materialize daily briefs
+    BRIEF_READ = "brief_read"  # Read daily briefs
 
 
 # Role to permissions mapping
 ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
-    Role.ADMIN: {Permission.INVOKE_TOOLS, Permission.KPI_WRITE, Permission.KPI_READ},
-    Role.MEMBER: {Permission.KPI_READ},  # Members can read KPIs but not write
+    Role.ADMIN: {
+        Permission.INVOKE_TOOLS,
+        Permission.KPI_WRITE,
+        Permission.KPI_READ,
+        Permission.BRIEF_MATERIALIZE,
+        Permission.BRIEF_READ,
+    },
+    Role.MEMBER: {Permission.KPI_READ, Permission.BRIEF_READ},  # Members can read KPIs and briefs
 }
 
 
@@ -73,3 +81,27 @@ def can_read_kpis(role: str) -> bool:
         True if the role can read KPIs, False otherwise.
     """
     return has_permission(role, Permission.KPI_READ)
+
+
+def can_materialize_briefs(role: str) -> bool:
+    """Check if a role can materialize daily briefs.
+
+    Args:
+        role: The user's role as a string.
+
+    Returns:
+        True if the role can materialize briefs, False otherwise.
+    """
+    return has_permission(role, Permission.BRIEF_MATERIALIZE)
+
+
+def can_read_briefs(role: str) -> bool:
+    """Check if a role can read daily briefs.
+
+    Args:
+        role: The user's role as a string.
+
+    Returns:
+        True if the role can read briefs, False otherwise.
+    """
+    return has_permission(role, Permission.BRIEF_READ)
