@@ -31,6 +31,14 @@ A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 - Runner idempotency (retries don't create duplicates)
 - Dev console UI for inspecting database state
 
+### Item 5: Cofounder Conversation API + Playground UI
+- Conversation persistence (conversations + messages tables)
+- Deterministic intent-based chat responses (no LLM required)
+- Chat commands: brief, kpis, kpi:<name>, outbox, help
+- Strict tenant isolation for conversations
+- Audit logging and usage metering for every chat request
+- Playground UI for interactive testing
+
 ## Quick Start
 
 ```bash
@@ -49,6 +57,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_phase0.sh         # KPI Store smoke test
 ./scripts/smoke_phase0_item3.sh   # Daily Briefs smoke test
 ./scripts/smoke_phase0_item4.sh   # Notifications + Runner smoke test
+./scripts/smoke_phase0_item5.sh   # Cofounder Chat smoke test
 ```
 
 ## API Overview
@@ -70,6 +79,11 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `GET /v1/notifications/outbox` | List user's notifications |
 | `POST /v1/notifications/{id}/ack` | Acknowledge a notification |
 | `POST /v1/jobs/daily-brief` | Run daily brief job (admin only, idempotent) |
+| `POST /v1/conversations` | Create a new conversation |
+| `GET /v1/conversations` | List user's conversations |
+| `GET /v1/conversations/{id}` | Get conversation with messages |
+| `POST /v1/cofounder/chat` | Send message to Cofounder assistant |
+| `GET /ui` | Playground UI (requires PLAYGROUND_UI_ENABLED=1) |
 
 See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
 
@@ -141,8 +155,64 @@ Open in browser: `http://localhost:8000/console?key=your-secret-key`
 | `/console?key=...` | Overview with database statistics |
 | `/console/tenants?key=...` | List all tenants |
 | `/console/tenants/{tenant_id}?key=...` | Tenant detail (users, KPIs, briefs, notifications) |
-| `/console/db/{table}?key=...` | Table viewer (tenants, users, kpi_definitions, kpi_points, briefs, audit_logs, usage_events, idempotency_keys, notification_prefs, notification_outbox) |
+| `/console/db/{table}?key=...` | Table viewer (tenants, users, kpi_definitions, kpi_points, briefs, audit_logs, usage_events, idempotency_keys, notification_prefs, notification_outbox, conversations, messages) |
 | `/console/db/download?key=...` | Download SQLite database file |
+
+## Playground UI (Interactive Chat)
+
+The Playground UI provides a user-facing interface for interacting with the Cofounder assistant.
+
+### Enabling the Playground
+
+Set the environment variable before starting the server:
+
+```bash
+export PLAYGROUND_UI_ENABLED=1
+
+poetry run uvicorn app.main:app --reload
+```
+
+### Accessing the Playground
+
+Open in browser: `http://localhost:8000/ui`
+
+The UI allows you to:
+- Configure credentials (Tenant ID, API Key, User ID) saved to localStorage
+- Create and manage conversations
+- Send messages and view assistant responses
+- Use quick buttons for common commands
+
+## Cofounder Chat Commands
+
+The Cofounder assistant responds with deterministic, data-driven responses. No LLM API keys required.
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show available commands |
+| `today's brief` or `brief` | Get the latest daily brief with summary and highlights |
+| `kpis` | List all KPIs with their latest values |
+| `kpi:<name>` | Get detailed summary for a specific KPI (e.g., `kpi:MRR`) |
+| `outbox` or `notifications` | View queued notifications |
+
+### Example: Chat API
+
+```bash
+# Send a message (creates new conversation if conversation_id not provided)
+curl -X POST http://localhost:8000/v1/cofounder/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"message": "today'\''s brief"}'
+
+# Continue conversation
+curl -X POST http://localhost:8000/v1/cofounder/chat \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"conversation_id": "...", "message": "kpis"}'
+```
 
 ## Tech Stack
 
@@ -167,12 +237,15 @@ bespin/
 │   │   │   ├── rbac.py          # Access control
 │   │   │   ├── idempotency.py   # Idempotency handling
 │   │   │   └── briefs.py        # Brief generation logic
-│   │   └── console/             # Dev Console UI
-│   │       └── router.py        # Console endpoints
+│   │   ├── console/             # Dev Console UI
+│   │   │   └── router.py        # Console endpoints
+│   │   └── playground/          # Playground UI
+│   │       └── router.py        # Playground endpoints
 │   └── tests/
 │       └── test_tools_invoke.py # Comprehensive test suite
 └── scripts/
     ├── smoke_phase0.sh          # KPI Store smoke test
     ├── smoke_phase0_item3.sh    # Daily Briefs smoke test
-    └── smoke_phase0_item4.sh    # Notifications + Runner smoke test
+    ├── smoke_phase0_item4.sh    # Notifications + Runner smoke test
+    └── smoke_phase0_item5.sh    # Cofounder Chat smoke test
 ```

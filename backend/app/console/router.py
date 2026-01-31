@@ -11,11 +11,13 @@ from app.database import get_db
 from app.gateway.models import (
     AuditLog,
     Brief,
+    Conversation,
     GatewayTenant,
     GatewayUser,
     IdempotencyKey,
     KPIDefinition,
     KPIPoint,
+    Message,
     NotificationOutbox,
     NotificationPref,
     UsageEvent,
@@ -39,6 +41,8 @@ ALLOWED_TABLES = {
     "idempotency_keys": IdempotencyKey,
     "notification_prefs": NotificationPref,
     "notification_outbox": NotificationOutbox,
+    "conversations": Conversation,
+    "messages": Message,
 }
 
 
@@ -117,6 +121,8 @@ def console_overview(
         "Idempotency Keys": db.query(func.count(IdempotencyKey.id)).scalar() or 0,
         "Notification Prefs": db.query(func.count()).select_from(NotificationPref).scalar() or 0,
         "Notification Outbox": db.query(func.count(NotificationOutbox.id)).scalar() or 0,
+        "Conversations": db.query(func.count(Conversation.conversation_id)).scalar() or 0,
+        "Messages": db.query(func.count(Message.message_id)).scalar() or 0,
     }
 
     stats_html = ""

@@ -10,8 +10,10 @@ from app.main import app
 from app.gateway.models import (
     AuditLog,
     Brief,
+    Conversation,
     KPIDefinition,
     KPIPoint,
+    Message,
     NotificationOutbox,
     NotificationPref,
     UsageEvent,
@@ -2464,3 +2466,541 @@ class TestNotificationOutboxFilters:
         acked_items = acked_response.json()["items"]
         assert len(acked_items) == 1
         assert acked_items[0]["status"] == "acked"
+
+
+# --- Conversation and Chat Tests (Item #5) ---
+
+
+class TestConversationCreation:
+    """Tests for conversation creation and listing."""
+
+    def test_member_can_create_conversation(self, client, tenant, member_user):
+        """Test that a member can create a conversation."""
+        response = client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "My Test Conversation"},
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert "conversation_id" in data
+        assert data["title"] == "My Test Conversation"
+        assert "created_at" in data
+
+    def test_admin_can_create_conversation(self, client, tenant, admin_user):
+        """Test that an admin can create a conversation."""
+        response = client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "Admin Conversation"},
+        )
+        assert response.status_code == 201
+
+    def test_list_conversations_returns_only_own(self, client, tenant, admin_user, member_user):
+        """Test that conversation listing only returns user's own conversations."""
+        # Admin creates a conversation
+        client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "Admin's Chat"},
+        )
+
+        # Member creates a conversation
+        client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "Member's Chat"},
+        )
+
+        # Member lists conversations - should only see their own
+        response = client.get(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert len(data["items"]) == 1
+        assert data["items"][0]["title"] == "Member's Chat"
+
+
+class TestChatPersistence:
+    """Tests for chat message persistence."""
+
+    def test_chat_persists_messages(self, client, tenant, member_user):
+        """Test that chat persists both user and assistant messages."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Send a chat message
+        chat_response = client.post(
+            "/v1/cofounder/chat",
+            headers=headers,
+            json={"message": "help"},
+        )
+        assert chat_response.status_code == 200
+        chat_data = chat_response.json()
+        conversation_id = chat_data["conversation_id"]
+
+        # Fetch conversation and verify messages
+        conv_response = client.get(
+            f"/v1/conversations/{conversation_id}",
+            headers=headers,
+        )
+        assert conv_response.status_code == 200
+        conv_data = conv_response.json()
+        messages = conv_data["messages"]
+
+        # Should have 2 messages: user + assistant
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "help"
+        assert messages[1]["role"] == "assistant"
+        assert "Available commands" in messages[1]["content"]
+
+    def test_chat_continues_existing_conversation(self, client, tenant, member_user):
+        """Test that chat can continue an existing conversation."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # First message (creates conversation)
+        resp1 = client.post("/v1/cofounder/chat", headers=headers, json={"message": "help"})
+        conversation_id = resp1.json()["conversation_id"]
+
+        # Second message (same conversation)
+        resp2 = client.post(
+            "/v1/cofounder/chat",
+            headers=headers,
+            json={"conversation_id": conversation_id, "message": "kpis"},
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["conversation_id"] == conversation_id
+
+        # Verify all messages in conversation
+        conv_response = client.get(f"/v1/conversations/{conversation_id}", headers=headers)
+        messages = conv_response.json()["messages"]
+        assert len(messages) == 4  # 2 user + 2 assistant
+
+
+class TestChatAuditAndUsage:
+    """Tests for chat audit logging and usage metering."""
+
+    def test_chat_emits_audit_and_usage(self, client, tenant, member_user):
+        """Test that each chat request emits exactly 1 audit log + 1 usage event."""
+        headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Count existing audit logs and usage events
+        db = TestingSessionLocal()
+        initial_audit_count = db.query(AuditLog).filter(
+            AuditLog.tenant_id == tenant["tenant_id"],
+            AuditLog.action == "cofounder.chat",
+        ).count()
+        initial_usage_count = db.query(UsageEvent).filter(
+            UsageEvent.tenant_id == tenant["tenant_id"],
+            UsageEvent.activity_type == "assistant_query",
+        ).count()
+        db.close()
+
+        # Send a chat message
+        chat_response = client.post(
+            "/v1/cofounder/chat",
+            headers=headers,
+            json={"message": "help"},
+        )
+        assert chat_response.status_code == 200
+        request_id = chat_response.json()["request_id"]
+
+        # Verify exactly 1 new audit log
+        db = TestingSessionLocal()
+        final_audit_count = db.query(AuditLog).filter(
+            AuditLog.tenant_id == tenant["tenant_id"],
+            AuditLog.action == "cofounder.chat",
+        ).count()
+        assert final_audit_count == initial_audit_count + 1
+
+        # Verify the audit log has correct request_id
+        audit = db.query(AuditLog).filter(
+            AuditLog.request_id == request_id
+        ).first()
+        assert audit is not None
+        assert audit.tool_name == "chat"
+
+        # Verify exactly 1 new usage event
+        final_usage_count = db.query(UsageEvent).filter(
+            UsageEvent.tenant_id == tenant["tenant_id"],
+            UsageEvent.activity_type == "assistant_query",
+        ).count()
+        assert final_usage_count == initial_usage_count + 1
+
+        usage = db.query(UsageEvent).filter(
+            UsageEvent.request_id == request_id
+        ).first()
+        assert usage is not None
+        assert usage.units == 1
+        assert usage.tool_name == "chat"
+        db.close()
+
+
+class TestBriefIntent:
+    """Tests for the brief/today chat intent."""
+
+    def test_brief_intent_returns_brief_card(self, client, tenant, admin_user, member_user):
+        """Test that 'today's brief' returns a brief card with expected fields."""
+        admin_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+        member_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Create a KPI
+        kpi_response = client.post(
+            "/v1/kpis",
+            headers=admin_headers,
+            json={"name": "MRR", "unit": "GBP"},
+        )
+        kpi_id = kpi_response.json()["kpi_id"]
+
+        # Ingest points
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers=admin_headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 1000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 1250.0},
+                ]
+            },
+        )
+
+        # Materialize brief
+        client.post(
+            "/v1/briefs/materialize",
+            headers={**admin_headers, "Idempotency-Key": "brief-test-1"},
+            json={"date": "2026-01-31", "window_days": 7, "top_n": 3},
+        )
+
+        # Member asks for today's brief
+        chat_response = client.post(
+            "/v1/cofounder/chat",
+            headers=member_headers,
+            json={"message": "today's brief", "date": "2026-01-31"},
+        )
+        assert chat_response.status_code == 200
+        data = chat_response.json()
+
+        # Verify assistant message
+        assert "Here's your brief" in data["assistant_message"]["content"]
+
+        # Verify brief card
+        cards = data["assistant_message"]["cards"]
+        assert len(cards) == 1
+        assert cards[0]["type"] == "brief"
+        assert cards[0]["date"] == "2026-01-31"
+        assert "brief_id" in cards[0]
+        assert "summary" in cards[0]
+        assert "highlights" in cards[0]
+
+    def test_brief_intent_no_brief_exists(self, client, tenant, member_user):
+        """Test that brief intent returns helpful message when no brief exists."""
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "brief"},
+        )
+        assert response.status_code == 200
+        content = response.json()["assistant_message"]["content"]
+        assert "No brief found" in content
+        assert "/v1/briefs/materialize" in content or "/v1/jobs/daily-brief" in content
+
+
+class TestTenantIsolation:
+    """Tests for conversation tenant isolation."""
+
+    def test_tenant_cannot_access_other_tenant_conversation(
+        self, client, tenant, member_user, other_tenant, other_tenant_user
+    ):
+        """Test that tenant A cannot access tenant B's conversation."""
+        # Tenant A creates a conversation
+        response = client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "Tenant A Chat"},
+        )
+        conversation_id = response.json()["conversation_id"]
+
+        # Tenant B tries to access it
+        response = client.get(
+            f"/v1/conversations/{conversation_id}",
+            headers={
+                "X-Tenant-ID": other_tenant["tenant_id"],
+                "X-User-ID": other_tenant_user["user_id"],
+                "X-API-Key": other_tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404
+
+    def test_user_cannot_access_other_user_conversation_same_tenant(
+        self, client, tenant, admin_user, member_user
+    ):
+        """Test that user A cannot access user B's conversation in same tenant."""
+        # Admin creates a conversation
+        response = client.post(
+            "/v1/conversations",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"title": "Admin's Private Chat"},
+        )
+        conversation_id = response.json()["conversation_id"]
+
+        # Member tries to access it
+        response = client.get(
+            f"/v1/conversations/{conversation_id}",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 404
+
+
+class TestKPIIntent:
+    """Tests for the KPI chat intent."""
+
+    def test_kpi_intent_returns_list_with_latest(self, client, tenant, admin_user, member_user):
+        """Test that 'kpis' returns list with latest values."""
+        admin_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+        member_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Create two KPIs
+        kpi1 = client.post("/v1/kpis", headers=admin_headers, json={"name": "Revenue", "unit": "USD"})
+        kpi2 = client.post("/v1/kpis", headers=admin_headers, json={"name": "Users", "unit": "count"})
+
+        # Ingest points for first KPI only
+        kpi1_id = kpi1.json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi1_id}/points:bulk",
+            headers=admin_headers,
+            json={"points": [{"ts": "2026-01-31T00:00:00Z", "value": 50000.0}]},
+        )
+
+        # Member asks for KPIs
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers=member_headers,
+            json={"message": "show me kpis"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify cards
+        cards = data["assistant_message"]["cards"]
+        assert len(cards) == 2
+
+        # Check each card
+        kpi_names = {c["name"] for c in cards}
+        assert "Revenue" in kpi_names
+        assert "Users" in kpi_names
+
+        # Revenue should have latest value, Users should have None
+        for card in cards:
+            assert card["type"] == "kpi"
+            if card["name"] == "Revenue":
+                assert card["latest"] is not None
+                assert card["latest"]["value"] == 50000.0
+            else:
+                assert card["latest"] is None
+
+    def test_kpi_specific_summary(self, client, tenant, admin_user, member_user):
+        """Test that 'kpi:<name>' returns detailed summary."""
+        admin_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+        member_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Create KPI with points
+        kpi = client.post("/v1/kpis", headers=admin_headers, json={"name": "ARR", "unit": "USD"})
+        kpi_id = kpi.json()["kpi_id"]
+        client.post(
+            f"/v1/kpis/{kpi_id}/points:bulk",
+            headers=admin_headers,
+            json={
+                "points": [
+                    {"ts": "2026-01-24T00:00:00Z", "value": 100000.0},
+                    {"ts": "2026-01-31T00:00:00Z", "value": 125000.0},
+                ]
+            },
+        )
+
+        # Ask for specific KPI
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers=member_headers,
+            json={"message": "kpi:ARR"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        cards = data["assistant_message"]["cards"]
+        assert len(cards) == 1
+        assert cards[0]["type"] == "kpi_summary"
+        assert cards[0]["name"] == "ARR"
+        assert cards[0]["delta_abs"] == 25000.0
+        assert cards[0]["delta_pct"] == 25.0
+
+
+class TestHelpIntent:
+    """Tests for the help chat intent."""
+
+    def test_help_intent(self, client, tenant, member_user):
+        """Test that 'help' returns help text."""
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "help me"},
+        )
+        assert response.status_code == 200
+        content = response.json()["assistant_message"]["content"]
+        assert "Available commands" in content
+        assert "brief" in content
+        assert "kpis" in content
+
+
+class TestOutboxIntent:
+    """Tests for the outbox/notifications chat intent."""
+
+    def test_outbox_intent_returns_notifications(self, client, tenant, admin_user, member_user):
+        """Test that 'outbox' returns user's notifications."""
+        admin_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+        member_headers = {
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": member_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        }
+
+        # Run daily brief job to create notifications
+        client.post(
+            "/v1/jobs/daily-brief",
+            headers={**admin_headers, "Idempotency-Key": "outbox-test-1"},
+            json={"date": "2026-01-31"},
+        )
+
+        # Member asks for outbox
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers=member_headers,
+            json={"message": "show my outbox"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        cards = data["assistant_message"]["cards"]
+        assert len(cards) >= 1
+        assert cards[0]["type"] == "notification"
+        assert "status" in cards[0]
+
+
+class TestPlaygroundUI:
+    """Tests for the Playground UI endpoint."""
+
+    def test_playground_disabled_by_default(self, client):
+        """Test that playground is disabled by default (404)."""
+        response = client.get("/ui")
+        assert response.status_code == 404
+
+
+class TestConversationAutoTitle:
+    """Tests for automatic conversation title from first message."""
+
+    def test_conversation_title_from_message(self, client, tenant, member_user):
+        """Test that conversation title is derived from first message."""
+        response = client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "What are my top performing KPIs this week?"},
+        )
+        assert response.status_code == 200
+        conversation_id = response.json()["conversation_id"]
+
+        # Get conversation
+        conv = client.get(
+            f"/v1/conversations/{conversation_id}",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        # Title should be truncated to 40 chars
+        assert conv.json()["title"] == "What are my top performing KPIs this wee"

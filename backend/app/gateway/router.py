@@ -20,10 +20,12 @@ from app.gateway.idempotency import (
 from app.gateway.models import (
     AuditLog,
     Brief,
+    Conversation,
     GatewayTenant,
     GatewayUser,
     KPIDefinition,
     KPIPoint,
+    Message,
     NotificationOutbox,
     NotificationPref,
     UsageEvent,
@@ -34,11 +36,19 @@ from app.gateway.rbac import (
     can_read_briefs,
     can_read_kpis,
     can_run_jobs,
+    can_use_cofounder_chat,
     can_write_kpis,
 )
 from app.gateway.schemas import (
     BriefMaterializeRequest,
     BriefResponse,
+    ChatAssistantMessage,
+    ChatRequest,
+    ChatResponse,
+    ConversationCreate,
+    ConversationDetailResponse,
+    ConversationListResponse,
+    ConversationResponse,
     DailyBriefRunnerRequest,
     DailyBriefRunnerResponse,
     KPICreate,
@@ -46,6 +56,7 @@ from app.gateway.schemas import (
     KPIPointsBulkRequest,
     KPIPointsBulkResponse,
     KPIResponse,
+    MessageResponse,
     NotificationOutboxItem,
     NotificationOutboxResponse,
     NotificationPrefRequest,
@@ -1105,3 +1116,438 @@ def run_daily_brief_job(
     )
 
     return response
+
+
+# --- Conversation Endpoints ---
+
+
+@router.post("/conversations", response_model=ConversationResponse, status_code=status.HTTP_201_CREATED)
+def create_conversation(
+    request: ConversationCreate,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> ConversationResponse:
+    """Create a new conversation.
+
+    Requires admin or member role with chat permission.
+    """
+    if not can_use_cofounder_chat(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to use chat",
+        )
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    conversation = Conversation(
+        conversation_id=str(uuid.uuid4()),
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        title=request.title,
+        created_at=now,
+    )
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+
+    return ConversationResponse(
+        conversation_id=conversation.conversation_id,
+        title=conversation.title,
+        created_at=conversation.created_at,
+    )
+
+
+@router.get("/conversations", response_model=ConversationListResponse)
+def list_conversations(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> ConversationListResponse:
+    """List conversations for the current user.
+
+    Only returns conversations owned by this user within this tenant.
+    """
+    if not can_use_cofounder_chat(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to use chat",
+        )
+
+    conversations = db.query(Conversation).filter(
+        Conversation.tenant_id == context.tenant_id,
+        Conversation.user_id == context.user_id,
+    ).order_by(Conversation.created_at.desc()).all()
+
+    items = [
+        ConversationResponse(
+            conversation_id=c.conversation_id,
+            title=c.title,
+            created_at=c.created_at,
+        )
+        for c in conversations
+    ]
+    return ConversationListResponse(items=items)
+
+
+@router.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
+def get_conversation(
+    conversation_id: str,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> ConversationDetailResponse:
+    """Get a conversation with its messages.
+
+    Only the owner can view their conversation.
+    """
+    if not can_use_cofounder_chat(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to use chat",
+        )
+
+    # Fetch conversation with tenant and user isolation
+    conversation = db.query(Conversation).filter(
+        Conversation.conversation_id == conversation_id,
+        Conversation.tenant_id == context.tenant_id,
+        Conversation.user_id == context.user_id,
+    ).first()
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+
+    # Fetch messages for this conversation
+    messages = db.query(Message).filter(
+        Message.conversation_id == conversation_id,
+        Message.tenant_id == context.tenant_id,
+    ).order_by(Message.created_at.asc()).all()
+
+    message_responses = [
+        MessageResponse(
+            message_id=m.message_id,
+            role=m.role,
+            content=m.content,
+            cards=json.loads(m.metadata_json),
+            created_at=m.created_at,
+        )
+        for m in messages
+    ]
+
+    return ConversationDetailResponse(
+        conversation_id=conversation.conversation_id,
+        title=conversation.title,
+        created_at=conversation.created_at,
+        messages=message_responses,
+    )
+
+
+# --- Cofounder Chat Endpoint ---
+
+
+def _compute_kpi_summary(db: Session, tenant_id: str, kpi_id: str, window_days: int = 7) -> dict:
+    """Compute KPI summary (reusing logic from tools.py)."""
+    from datetime import timedelta
+
+    kpi = db.query(KPIDefinition).filter(
+        KPIDefinition.kpi_id == kpi_id,
+        KPIDefinition.tenant_id == tenant_id,
+    ).first()
+    if not kpi:
+        return {"error": f"KPI '{kpi_id}' not found"}
+
+    latest_point = db.query(KPIPoint).filter(
+        KPIPoint.tenant_id == tenant_id,
+        KPIPoint.kpi_id == kpi_id,
+    ).order_by(KPIPoint.ts.desc()).first()
+
+    if not latest_point:
+        return {"error": f"No data points found for KPI '{kpi_id}'"}
+
+    latest_ts = datetime.fromisoformat(latest_point.ts.replace("Z", "+00:00"))
+    window_start = latest_ts - timedelta(days=window_days)
+    window_start_str = window_start.isoformat().replace("+00:00", "Z")
+
+    start_point = db.query(KPIPoint).filter(
+        KPIPoint.tenant_id == tenant_id,
+        KPIPoint.kpi_id == kpi_id,
+        KPIPoint.ts >= window_start_str,
+        KPIPoint.ts <= latest_point.ts,
+    ).order_by(KPIPoint.ts.asc()).first()
+
+    if not start_point:
+        start_point = latest_point
+
+    delta_abs = latest_point.value - start_point.value
+    if start_point.value == 0:
+        delta_pct = None
+    else:
+        delta_pct = (delta_abs / start_point.value) * 100
+
+    return {
+        "kpi_id": kpi_id,
+        "name": kpi.name,
+        "unit": kpi.unit,
+        "latest": {"ts": latest_point.ts, "value": latest_point.value},
+        "start": {"ts": start_point.ts, "value": start_point.value},
+        "delta_abs": delta_abs,
+        "delta_pct": delta_pct,
+    }
+
+
+def _route_intent(
+    message: str,
+    tenant_id: str,
+    user_id: str,
+    date: str | None,
+    db: Session,
+) -> tuple[str, list[dict]]:
+    """Route message intent and generate deterministic response.
+
+    Returns tuple of (content, cards).
+    """
+    message_lower = message.lower()
+
+    # Intent: help
+    if "help" in message_lower:
+        content = (
+            "Available commands:\n"
+            "- 'today's brief' or 'brief' - Get your latest daily brief\n"
+            "- 'kpis' - List all KPIs with latest values\n"
+            "- 'kpi:<name>' - Get detailed summary for a specific KPI\n"
+            "- 'outbox' or 'notifications' - View queued notifications\n"
+            "- 'help' - Show this help message"
+        )
+        return content, []
+
+    # Intent: brief / today
+    if "brief" in message_lower or "today" in message_lower:
+        if date:
+            brief = db.query(Brief).filter(
+                Brief.tenant_id == tenant_id,
+                Brief.brief_date == date,
+            ).first()
+        else:
+            brief = db.query(Brief).filter(
+                Brief.tenant_id == tenant_id,
+            ).order_by(Brief.brief_date.desc()).first()
+
+        if not brief:
+            content = (
+                "No brief found. To generate a brief, an admin should run:\n"
+                "POST /v1/jobs/daily-brief or POST /v1/briefs/materialize"
+            )
+            return content, []
+
+        brief_content = json.loads(brief.content_json)
+        content = f"Here's your brief for {brief.brief_date}:"
+        cards = [{
+            "type": "brief",
+            "date": brief.brief_date,
+            "brief_id": brief.brief_id,
+            "summary": brief_content.get("summary", {}),
+            "highlights": brief_content.get("highlights", []),
+        }]
+        return content, cards
+
+    # Intent: outbox / notifications
+    if "outbox" in message_lower or "notification" in message_lower:
+        notifications = db.query(NotificationOutbox).filter(
+            NotificationOutbox.tenant_id == tenant_id,
+            NotificationOutbox.user_id == user_id,
+        ).order_by(NotificationOutbox.created_at.desc()).limit(10).all()
+
+        if not notifications:
+            content = "No notifications in your outbox."
+            return content, []
+
+        content = f"Found {len(notifications)} notification(s) in your outbox:"
+        cards = []
+        for notif in notifications:
+            payload = json.loads(notif.payload_json)
+            cards.append({
+                "type": "notification",
+                "id": notif.id,
+                "date": notif.notif_date,
+                "title": payload.get("title", notif.notification_type),
+                "status": notif.status,
+            })
+        return content, cards
+
+    # Intent: kpi:<name> (specific KPI summary)
+    import re
+    kpi_name_match = re.search(r"kpi:(\S+)", message_lower)
+    if kpi_name_match:
+        kpi_name = kpi_name_match.group(1)
+        # Find KPI by name (case-insensitive)
+        kpi = db.query(KPIDefinition).filter(
+            KPIDefinition.tenant_id == tenant_id,
+        ).all()
+        matching_kpi = None
+        for k in kpi:
+            if k.name.lower() == kpi_name.lower():
+                matching_kpi = k
+                break
+
+        if not matching_kpi:
+            content = f"KPI '{kpi_name}' not found."
+            return content, []
+
+        summary = _compute_kpi_summary(db, tenant_id, matching_kpi.kpi_id, window_days=7)
+        if "error" in summary:
+            content = summary["error"]
+            return content, []
+
+        content = f"Summary for KPI '{matching_kpi.name}':"
+        cards = [{
+            "type": "kpi_summary",
+            **summary,
+        }]
+        return content, cards
+
+    # Intent: kpis (list all)
+    if "kpi" in message_lower:
+        kpis = db.query(KPIDefinition).filter(
+            KPIDefinition.tenant_id == tenant_id,
+        ).all()
+
+        if not kpis:
+            content = "No KPIs defined for your tenant."
+            return content, []
+
+        content = f"Found {len(kpis)} KPI(s):"
+        cards = []
+        for kpi in kpis:
+            latest_point = db.query(KPIPoint).filter(
+                KPIPoint.tenant_id == tenant_id,
+                KPIPoint.kpi_id == kpi.kpi_id,
+            ).order_by(KPIPoint.ts.desc()).first()
+
+            card = {
+                "type": "kpi",
+                "kpi_id": kpi.kpi_id,
+                "name": kpi.name,
+                "unit": kpi.unit,
+                "latest": None,
+            }
+            if latest_point:
+                card["latest"] = {"ts": latest_point.ts, "value": latest_point.value}
+            cards.append(card)
+        return content, cards
+
+    # Fallback
+    content = "Try: 'today's brief', 'kpis', 'outbox', or 'help'"
+    return content, []
+
+
+@router.post("/cofounder/chat", response_model=ChatResponse)
+def cofounder_chat(
+    request: ChatRequest,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> ChatResponse:
+    """Send a message to the Cofounder AI assistant.
+
+    The assistant responds with deterministic, data-driven responses
+    based on your briefs, KPIs, and notifications.
+    """
+    if not can_use_cofounder_chat(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to use chat",
+        )
+
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    request_id = str(uuid.uuid4())
+
+    # Handle conversation: create new or use existing
+    if request.conversation_id:
+        conversation = db.query(Conversation).filter(
+            Conversation.conversation_id == request.conversation_id,
+            Conversation.tenant_id == context.tenant_id,
+            Conversation.user_id == context.user_id,
+        ).first()
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found",
+            )
+    else:
+        # Create new conversation with title from first message
+        title = request.message[:40] if len(request.message) > 40 else request.message
+        conversation = Conversation(
+            conversation_id=str(uuid.uuid4()),
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            title=title,
+            created_at=now,
+        )
+        db.add(conversation)
+
+    # Persist user message
+    user_message = Message(
+        message_id=str(uuid.uuid4()),
+        conversation_id=conversation.conversation_id,
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        role="user",
+        content=request.message,
+        metadata_json="[]",
+        created_at=now,
+    )
+    db.add(user_message)
+
+    # Generate assistant response (deterministic intent routing)
+    assistant_content, assistant_cards = _route_intent(
+        message=request.message,
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        date=request.date,
+        db=db,
+    )
+
+    # Persist assistant message
+    assistant_message_id = str(uuid.uuid4())
+    assistant_message = Message(
+        message_id=assistant_message_id,
+        conversation_id=conversation.conversation_id,
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        role="assistant",
+        content=assistant_content,
+        metadata_json=json.dumps(assistant_cards),
+        created_at=now,
+    )
+    db.add(assistant_message)
+
+    # Write audit log
+    audit_log = AuditLog(
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        action="cofounder.chat",
+        tool_name="chat",
+        request_id=request_id,
+    )
+    db.add(audit_log)
+
+    # Write usage event
+    usage_event = UsageEvent(
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        activity_type="assistant_query",
+        units=1,
+        tool_name="chat",
+        request_id=request_id,
+    )
+    db.add(usage_event)
+
+    db.commit()
+
+    return ChatResponse(
+        request_id=request_id,
+        conversation_id=conversation.conversation_id,
+        assistant_message=ChatAssistantMessage(
+            message_id=assistant_message_id,
+            content=assistant_content,
+            cards=assistant_cards,
+        ),
+    )
