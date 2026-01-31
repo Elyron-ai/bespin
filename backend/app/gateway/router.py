@@ -24,6 +24,8 @@ from app.gateway.models import (
     GatewayUser,
     KPIDefinition,
     KPIPoint,
+    NotificationOutbox,
+    NotificationPref,
     UsageEvent,
 )
 from app.gateway.rbac import (
@@ -31,16 +33,23 @@ from app.gateway.rbac import (
     can_materialize_briefs,
     can_read_briefs,
     can_read_kpis,
+    can_run_jobs,
     can_write_kpis,
 )
 from app.gateway.schemas import (
     BriefMaterializeRequest,
     BriefResponse,
+    DailyBriefRunnerRequest,
+    DailyBriefRunnerResponse,
     KPICreate,
     KPILatestResponse,
     KPIPointsBulkRequest,
     KPIPointsBulkResponse,
     KPIResponse,
+    NotificationOutboxItem,
+    NotificationOutboxResponse,
+    NotificationPrefRequest,
+    NotificationPrefResponse,
     TenantCreate,
     TenantResponse,
     ToolInvokeRequest,
@@ -724,3 +733,375 @@ def get_brief_by_date(
         request_id=brief.request_id,
         content=content,
     )
+
+
+# --- Notification Endpoints ---
+
+
+@router.get("/notifications/prefs", response_model=NotificationPrefResponse)
+def get_notification_prefs(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> NotificationPrefResponse:
+    """Get notification preferences for the current user.
+
+    Returns defaults if no preferences have been saved.
+    """
+    pref = db.query(NotificationPref).filter(
+        NotificationPref.tenant_id == context.tenant_id,
+        NotificationPref.user_id == context.user_id,
+    ).first()
+
+    if pref:
+        return NotificationPrefResponse(
+            daily_brief_enabled=bool(pref.daily_brief_enabled),
+            delivery_method=pref.delivery_method,
+        )
+
+    # Return defaults if no prefs exist
+    return NotificationPrefResponse(
+        daily_brief_enabled=True,
+        delivery_method="in_app",
+    )
+
+
+@router.put("/notifications/prefs", response_model=NotificationPrefResponse)
+def update_notification_prefs(
+    request: NotificationPrefRequest,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> NotificationPrefResponse:
+    """Update notification preferences for the current user."""
+    pref = db.query(NotificationPref).filter(
+        NotificationPref.tenant_id == context.tenant_id,
+        NotificationPref.user_id == context.user_id,
+    ).first()
+
+    now = datetime.utcnow()
+
+    if pref:
+        pref.daily_brief_enabled = 1 if request.daily_brief_enabled else 0
+        pref.delivery_method = request.delivery_method
+        pref.updated_at = now
+    else:
+        pref = NotificationPref(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            daily_brief_enabled=1 if request.daily_brief_enabled else 0,
+            delivery_method=request.delivery_method,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(pref)
+
+    db.commit()
+    db.refresh(pref)
+
+    return NotificationPrefResponse(
+        daily_brief_enabled=bool(pref.daily_brief_enabled),
+        delivery_method=pref.delivery_method,
+    )
+
+
+@router.get("/notifications/outbox", response_model=NotificationOutboxResponse)
+def list_notifications(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+    date: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+) -> NotificationOutboxResponse:
+    """List notifications for the current user.
+
+    Optional filters: date (YYYY-MM-DD), status (queued|acked), limit.
+    """
+    query = db.query(NotificationOutbox).filter(
+        NotificationOutbox.tenant_id == context.tenant_id,
+        NotificationOutbox.user_id == context.user_id,
+    )
+
+    if date:
+        query = query.filter(NotificationOutbox.notif_date == date)
+    if status:
+        query = query.filter(NotificationOutbox.status == status)
+
+    notifications = query.order_by(NotificationOutbox.created_at.desc()).limit(limit).all()
+
+    items = []
+    for notif in notifications:
+        items.append(NotificationOutboxItem(
+            id=notif.id,
+            notification_type=notif.notification_type,
+            date=notif.notif_date,
+            status=notif.status,
+            request_id=notif.request_id,
+            payload=json.loads(notif.payload_json),
+        ))
+
+    return NotificationOutboxResponse(items=items)
+
+
+@router.post("/notifications/{notification_id}/ack")
+def ack_notification(
+    notification_id: int,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> NotificationOutboxItem:
+    """Acknowledge a notification.
+
+    Only the owner of the notification can acknowledge it.
+    """
+    notif = db.query(NotificationOutbox).filter(
+        NotificationOutbox.id == notification_id,
+    ).first()
+
+    if not notif:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Notification {notification_id} not found",
+        )
+
+    # Verify ownership
+    if notif.tenant_id != context.tenant_id or notif.user_id != context.user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only acknowledge your own notifications",
+        )
+
+    notif.status = "acked"
+    db.commit()
+    db.refresh(notif)
+
+    return NotificationOutboxItem(
+        id=notif.id,
+        notification_type=notif.notification_type,
+        date=notif.notif_date,
+        status=notif.status,
+        request_id=notif.request_id,
+        payload=json.loads(notif.payload_json),
+    )
+
+
+# --- Job Runner Endpoints ---
+
+
+@router.post("/jobs/daily-brief", response_model=DailyBriefRunnerResponse)
+def run_daily_brief_job(
+    request: DailyBriefRunnerRequest,
+    context_and_key: Annotated[tuple[TenantContext, str], Depends(get_tenant_context)],
+    db: Session = Depends(get_db),
+) -> DailyBriefRunnerResponse:
+    """Run the daily brief job: materialize brief and enqueue notifications.
+
+    Requires admin role. Idempotent via Idempotency-Key header.
+    """
+    context, idempotency_key = context_and_key
+    endpoint = "/v1/jobs/daily-brief"
+
+    # Check RBAC: only admins can run jobs
+    if not can_run_jobs(context.user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to run jobs",
+        )
+
+    # Determine brief_date (default to today UTC if not provided)
+    brief_date = request.date
+    if brief_date is None:
+        brief_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Normalize request body for idempotency check
+    request_body = {
+        "date": brief_date,
+        "window_days": request.window_days,
+        "top_n": request.top_n,
+    }
+
+    # Check idempotency
+    try:
+        cached_response = check_idempotency(
+            db=db,
+            tenant_id=context.tenant_id,
+            endpoint=endpoint,
+            idempotency_key=idempotency_key,
+            request_body=request_body,
+        )
+        if cached_response is not None:
+            return DailyBriefRunnerResponse(**cached_response)
+    except IdempotencyConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+
+    # Ensure brief exists for this date
+    brief_created = False
+    existing_brief = db.query(Brief).filter(
+        Brief.tenant_id == context.tenant_id,
+        Brief.brief_date == brief_date,
+    ).first()
+
+    if existing_brief:
+        brief_id = existing_brief.brief_id
+        brief_content = json.loads(existing_brief.content_json)
+    else:
+        # Create the brief using the same generator as /v1/briefs/materialize
+        brief_content = generate_daily_brief(
+            db=db,
+            tenant_id=context.tenant_id,
+            brief_date=brief_date,
+            window_days=request.window_days,
+            top_n=request.top_n,
+        )
+
+        brief_id = str(uuid.uuid4())
+        brief_request_id = str(uuid.uuid4())
+
+        brief = Brief(
+            brief_id=brief_id,
+            tenant_id=context.tenant_id,
+            brief_date=brief_date,
+            window_days=request.window_days,
+            top_n=request.top_n,
+            content_json=json.dumps(brief_content),
+            request_id=brief_request_id,
+        )
+        db.add(brief)
+
+        # Write audit log for brief creation
+        audit_log = AuditLog(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            action="briefs.materialize",
+            tool_name="daily_brief",
+            request_id=brief_request_id,
+        )
+        db.add(audit_log)
+
+        # Write usage event for brief creation
+        usage_event = UsageEvent(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            activity_type="daily_brief_generated",
+            units=1,
+            tool_name="daily_brief",
+            request_id=brief_request_id,
+        )
+        db.add(usage_event)
+
+        brief_created = True
+
+    # Enqueue notifications for opted-in users
+    # Find all users in this tenant with daily_brief_enabled=1 and delivery_method="in_app"
+    opted_in_prefs = db.query(NotificationPref).filter(
+        NotificationPref.tenant_id == context.tenant_id,
+        NotificationPref.daily_brief_enabled == 1,
+        NotificationPref.delivery_method == "in_app",
+    ).all()
+
+    # Also include users without explicit prefs (defaults: enabled=true, method=in_app)
+    # Get user_ids that have explicit prefs
+    explicit_user_ids = {p.user_id for p in opted_in_prefs}
+
+    # Get all users in this tenant
+    all_users = db.query(GatewayUser).filter(
+        GatewayUser.tenant_id == context.tenant_id,
+    ).all()
+
+    # Users with default prefs (no explicit row)
+    default_enabled_users = [u for u in all_users if u.user_id not in explicit_user_ids]
+
+    # Also include users who explicitly opted out
+    opted_out_prefs = db.query(NotificationPref).filter(
+        NotificationPref.tenant_id == context.tenant_id,
+        NotificationPref.daily_brief_enabled == 0,
+    ).all()
+    opted_out_user_ids = {p.user_id for p in opted_out_prefs}
+
+    # Final list of users to notify: explicit opt-in + default (minus explicit opt-out)
+    users_to_notify = [p.user_id for p in opted_in_prefs]
+    users_to_notify.extend([u.user_id for u in default_enabled_users if u.user_id not in opted_out_user_ids])
+
+    # Generate a single request_id for this runner execution
+    runner_request_id = str(uuid.uuid4())
+
+    # Prepare notification payload
+    notification_payload = {
+        "title": "Daily Brief",
+        "date": brief_date,
+        "summary": brief_content.get("summary", {}),
+        "highlights": brief_content.get("highlights", []),
+    }
+    payload_json = json.dumps(notification_payload)
+
+    notifications_inserted = 0
+    notifications_ignored = 0
+
+    for user_id in users_to_notify:
+        # Check if notification already exists (UNIQUE constraint)
+        existing_notif = db.query(NotificationOutbox).filter(
+            NotificationOutbox.tenant_id == context.tenant_id,
+            NotificationOutbox.user_id == user_id,
+            NotificationOutbox.notification_type == "daily_brief",
+            NotificationOutbox.notif_date == brief_date,
+        ).first()
+
+        if existing_notif:
+            notifications_ignored += 1
+        else:
+            notif = NotificationOutbox(
+                tenant_id=context.tenant_id,
+                user_id=user_id,
+                notification_type="daily_brief",
+                notif_date=brief_date,
+                status="queued",
+                payload_json=payload_json,
+                request_id=runner_request_id,
+            )
+            db.add(notif)
+            notifications_inserted += 1
+
+            # Write usage event for each notification
+            usage_event = UsageEvent(
+                tenant_id=context.tenant_id,
+                user_id=context.user_id,
+                activity_type="notification_enqueued",
+                units=1,
+                tool_name="daily_brief",
+                request_id=runner_request_id,
+            )
+            db.add(usage_event)
+
+    # Write a single audit log for the enqueue action
+    if notifications_inserted > 0 or notifications_ignored > 0:
+        audit_log = AuditLog(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            action="notifications.enqueue",
+            tool_name="daily_brief",
+            request_id=runner_request_id,
+        )
+        db.add(audit_log)
+
+    db.commit()
+
+    # Build response
+    response = DailyBriefRunnerResponse(
+        date=brief_date,
+        brief_id=brief_id,
+        brief_created=brief_created,
+        notifications_inserted=notifications_inserted,
+        notifications_ignored=notifications_ignored,
+    )
+
+    # Store idempotency record
+    store_idempotency(
+        db=db,
+        tenant_id=context.tenant_id,
+        endpoint=endpoint,
+        idempotency_key=idempotency_key,
+        request_body=request_body,
+        response=response.model_dump(),
+    )
+
+    return response

@@ -163,3 +163,47 @@ class BriefResponse(BaseModel):
     brief_id: str
     request_id: str
     content: BriefContent
+
+
+# Notification schemas
+class NotificationPrefRequest(BaseModel):
+    """Request schema for updating notification preferences."""
+    daily_brief_enabled: bool = True
+    delivery_method: str = Field("in_app", pattern="^in_app$")
+
+
+class NotificationPrefResponse(BaseModel):
+    """Response schema for notification preferences."""
+    daily_brief_enabled: bool
+    delivery_method: str
+
+
+class NotificationOutboxItem(BaseModel):
+    """A single notification in the outbox."""
+    id: int
+    notification_type: str
+    date: str
+    status: str
+    request_id: str
+    payload: dict[str, Any]
+
+
+class NotificationOutboxResponse(BaseModel):
+    """Response schema for notification outbox listing."""
+    items: list[NotificationOutboxItem]
+
+
+class DailyBriefRunnerRequest(BaseModel):
+    """Request schema for the daily brief runner."""
+    date: str | None = Field(None, description="YYYY-MM-DD, defaults to today UTC")
+    window_days: int = Field(7, ge=1, le=365)
+    top_n: int = Field(3, ge=1, le=100)
+
+
+class DailyBriefRunnerResponse(BaseModel):
+    """Response schema for the daily brief runner."""
+    date: str
+    brief_id: str
+    brief_created: bool
+    notifications_inserted: int
+    notifications_ignored: int
