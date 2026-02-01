@@ -53,35 +53,37 @@ def client():
 
 @pytest.fixture
 def tenant(client):
-    """Create a test tenant."""
+    """Create a test tenant with bootstrap admin."""
     response = client.post(
         "/v1/tenants",
-        json={"name": "Test Tenant", "region": "us-east-1"},
+        json={"name": "Test Tenant", "region": "us-east-1", "admin_email": "admin@test.com"},
     )
     assert response.status_code == 201
     return response.json()
 
 
 @pytest.fixture
-def admin_user(client, tenant):
-    """Create an admin user for the test tenant."""
-    response = client.post(
-        "/v1/users",
-        json={
-            "tenant_id": tenant["tenant_id"],
-            "email": "admin@test.com",
-            "role": "admin",
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
+def admin_user(tenant):
+    """Get the admin user created with the tenant."""
+    # The admin user is now created alongside the tenant
+    return {
+        "user_id": tenant["admin"]["user_id"],
+        "tenant_id": tenant["tenant_id"],
+        "email": tenant["admin"]["email"],
+        "role": tenant["admin"]["role"],
+    }
 
 
 @pytest.fixture
-def member_user(client, tenant):
+def member_user(client, tenant, admin_user):
     """Create a member user for the test tenant."""
     response = client.post(
         "/v1/users",
+        headers={
+            "X-Tenant-ID": tenant["tenant_id"],
+            "X-User-ID": admin_user["user_id"],
+            "X-API-Key": tenant["api_key"],
+        },
         json={
             "tenant_id": tenant["tenant_id"],
             "email": "member@test.com",
@@ -94,38 +96,34 @@ def member_user(client, tenant):
 
 @pytest.fixture
 def other_tenant(client):
-    """Create a different tenant."""
+    """Create a different tenant with bootstrap admin."""
     response = client.post(
         "/v1/tenants",
-        json={"name": "Other Tenant", "region": "eu-west-1"},
+        json={"name": "Other Tenant", "region": "eu-west-1", "admin_email": "other-admin@test.com"},
     )
     assert response.status_code == 201
     return response.json()
 
 
 @pytest.fixture
-def other_tenant_user(client, other_tenant):
-    """Create a user for the other tenant."""
-    response = client.post(
-        "/v1/users",
-        json={
-            "tenant_id": other_tenant["tenant_id"],
-            "email": "other@test.com",
-            "role": "admin",
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
+def other_tenant_user(other_tenant):
+    """Get the admin user for the other tenant."""
+    return {
+        "user_id": other_tenant["admin"]["user_id"],
+        "tenant_id": other_tenant["tenant_id"],
+        "email": other_tenant["admin"]["email"],
+        "role": other_tenant["admin"]["role"],
+    }
 
 
 class TestTenantCreation:
     """Tests for tenant creation endpoint."""
 
     def test_create_tenant_success(self, client):
-        """Test successful tenant creation."""
+        """Test successful tenant creation with bootstrap admin."""
         response = client.post(
             "/v1/tenants",
-            json={"name": "My Tenant", "region": "us-west-2"},
+            json={"name": "My Tenant", "region": "us-west-2", "admin_email": "bootstrap@test.com"},
         )
         assert response.status_code == 201
         data = response.json()
@@ -134,12 +132,25 @@ class TestTenantCreation:
         assert data["region"] == "us-west-2"
         assert "api_key" in data
         assert len(data["api_key"]) > 20  # Ensure API key is substantial
+        # Check bootstrap admin was created
+        assert "admin" in data
+        assert data["admin"]["email"] == "bootstrap@test.com"
+        assert data["admin"]["role"] == "admin"
+        assert "user_id" in data["admin"]
 
     def test_create_tenant_missing_name(self, client):
         """Test tenant creation with missing name."""
         response = client.post(
             "/v1/tenants",
-            json={"region": "us-east-1"},
+            json={"region": "us-east-1", "admin_email": "admin@test.com"},
+        )
+        assert response.status_code == 422
+
+    def test_create_tenant_missing_admin_email(self, client):
+        """Test tenant creation with missing admin_email."""
+        response = client.post(
+            "/v1/tenants",
+            json={"name": "My Tenant", "region": "us-east-1"},
         )
         assert response.status_code == 422
 
@@ -147,10 +158,15 @@ class TestTenantCreation:
 class TestUserCreation:
     """Tests for user creation endpoint."""
 
-    def test_create_user_success(self, client, tenant):
-        """Test successful user creation."""
+    def test_create_user_success(self, client, tenant, admin_user):
+        """Test successful user creation by admin."""
         response = client.post(
             "/v1/users",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
             json={
                 "tenant_id": tenant["tenant_id"],
                 "email": "user@test.com",
@@ -164,22 +180,33 @@ class TestUserCreation:
         assert data["email"] == "user@test.com"
         assert data["role"] == "admin"
 
-    def test_create_user_invalid_tenant(self, client):
-        """Test user creation with non-existent tenant."""
+    def test_create_user_invalid_tenant(self, client, tenant, admin_user):
+        """Test user creation for different tenant fails."""
         response = client.post(
             "/v1/users",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
             json={
                 "tenant_id": "00000000-0000-0000-0000-000000000000",
                 "email": "user@test.com",
                 "role": "admin",
             },
         )
-        assert response.status_code == 404
+        # Should fail because you can't create users for a different tenant
+        assert response.status_code == 403
 
-    def test_create_user_invalid_role(self, client, tenant):
+    def test_create_user_invalid_role(self, client, tenant, admin_user):
         """Test user creation with invalid role."""
         response = client.post(
             "/v1/users",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
             json={
                 "tenant_id": tenant["tenant_id"],
                 "email": "user@test.com",
@@ -187,6 +214,23 @@ class TestUserCreation:
             },
         )
         assert response.status_code == 422
+
+    def test_member_cannot_create_user(self, client, tenant, member_user):
+        """Test that members cannot create users."""
+        response = client.post(
+            "/v1/users",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "tenant_id": tenant["tenant_id"],
+                "email": "newuser@test.com",
+                "role": "member",
+            },
+        )
+        assert response.status_code == 403
 
 
 class TestToolInvokeMissingHeaders:
@@ -2399,6 +2443,8 @@ class TestNotificationAck:
         notif_id = outbox.json()["items"][0]["id"]
 
         # Member tries to ack admin's notification
+        # Returns 404 instead of 403 to prevent IDOR information leakage
+        # (doesn't reveal whether the notification exists for another user)
         ack_response = client.post(
             f"/v1/notifications/{notif_id}/ack",
             headers={
@@ -2407,7 +2453,7 @@ class TestNotificationAck:
                 "X-API-Key": tenant["api_key"],
             },
         )
-        assert ack_response.status_code == 403
+        assert ack_response.status_code == 404
 
 
 class TestNotificationOutboxFilters:

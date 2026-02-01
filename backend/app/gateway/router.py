@@ -40,6 +40,7 @@ from app.gateway.rbac import (
     can_write_kpis,
 )
 from app.gateway.schemas import (
+    BootstrapAdmin,
     BriefMaterializeRequest,
     BriefResponse,
     ChatAssistantMessage,
@@ -82,15 +83,19 @@ class TenantContext:
     user: GatewayUser
 
 
-def get_basic_tenant_context(
-    x_tenant_id: Annotated[str | None, Header()] = None,
-    x_user_id: Annotated[str | None, Header()] = None,
-    x_api_key: Annotated[str | None, Header()] = None,
-    db: Session = Depends(get_db),
+def _validate_and_authenticate(
+    db: Session,
+    x_tenant_id: str | None,
+    x_user_id: str | None,
+    x_api_key: str | None,
 ) -> TenantContext:
-    """Validate headers and return tenant context (no idempotency key required).
+    """Common validation and authentication logic for tenant context.
 
-    For use with endpoints that don't need idempotency.
+    Args:
+        db: Database session.
+        x_tenant_id: Tenant ID from header.
+        x_user_id: User ID from header.
+        x_api_key: API key from header.
 
     Returns:
         TenantContext with authenticated tenant and user.
@@ -119,7 +124,8 @@ def get_basic_tenant_context(
     tenant = db.query(GatewayTenant).filter(
         GatewayTenant.tenant_id == x_tenant_id
     ).first()
-    if not tenant or tenant.api_key != x_api_key:
+    # Use constant-time comparison to prevent timing attacks
+    if not tenant or not secrets.compare_digest(tenant.api_key, x_api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid tenant ID or API key",
@@ -148,6 +154,25 @@ def get_basic_tenant_context(
     )
 
 
+def get_basic_tenant_context(
+    x_tenant_id: Annotated[str | None, Header()] = None,
+    x_user_id: Annotated[str | None, Header()] = None,
+    x_api_key: Annotated[str | None, Header()] = None,
+    db: Session = Depends(get_db),
+) -> TenantContext:
+    """Validate headers and return tenant context (no idempotency key required).
+
+    For use with endpoints that don't need idempotency.
+
+    Returns:
+        TenantContext with authenticated tenant and user.
+
+    Raises:
+        HTTPException: On missing headers, auth failure, or authorization failure.
+    """
+    return _validate_and_authenticate(db, x_tenant_id, x_user_id, x_api_key)
+
+
 def generate_api_key() -> str:
     """Generate a secure random API key."""
     return secrets.token_urlsafe(32)
@@ -161,20 +186,48 @@ def create_tenant(
     tenant_data: TenantCreate,
     db: Session = Depends(get_db),
 ) -> TenantResponse:
-    """Create a new tenant.
+    """Create a new tenant with a bootstrap admin user.
 
     This endpoint is open (no auth) for MVP purposes.
+    Creates a tenant and an initial admin user for bootstrapping.
     """
+    tenant_id = str(uuid.uuid4())
+    admin_user_id = str(uuid.uuid4())
+
+    # Create tenant
     tenant = GatewayTenant(
-        tenant_id=str(uuid.uuid4()),
+        tenant_id=tenant_id,
         name=tenant_data.name,
         region=tenant_data.region,
         api_key=generate_api_key(),
     )
     db.add(tenant)
+
+    # Create bootstrap admin user
+    admin_user = GatewayUser(
+        user_id=admin_user_id,
+        tenant_id=tenant_id,
+        email=tenant_data.admin_email,
+        role="admin",
+    )
+    db.add(admin_user)
+
     db.commit()
     db.refresh(tenant)
-    return TenantResponse.model_validate(tenant)
+    db.refresh(admin_user)
+
+    return TenantResponse(
+        tenant_id=tenant.tenant_id,
+        name=tenant.name,
+        region=tenant.region,
+        api_key=tenant.api_key,
+        created_at=tenant.created_at,
+        admin=BootstrapAdmin(
+            user_id=admin_user.user_id,
+            email=admin_user.email,
+            role=admin_user.role,
+        ),
+    )
 
 
 # --- User Endpoints ---
@@ -183,17 +236,25 @@ def create_tenant(
 @router.post("/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 def create_user(
     user_data: UserCreate,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
     db: Session = Depends(get_db),
 ) -> UserResponse:
-    """Create a new user under a tenant."""
-    # Verify tenant exists
-    tenant = db.query(GatewayTenant).filter(
-        GatewayTenant.tenant_id == user_data.tenant_id
-    ).first()
-    if not tenant:
+    """Create a new user under a tenant.
+
+    Requires admin role. Users can only be created within the authenticated tenant.
+    """
+    # Check RBAC: only admins can create users
+    if context.user.role != "admin":
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tenant '{user_data.tenant_id}' not found",
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to create users",
+        )
+
+    # Security: Users can only create users within their own tenant
+    if user_data.tenant_id != context.tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot create users for a different tenant",
         )
 
     user = GatewayUser(
@@ -226,59 +287,15 @@ def get_tenant_context(
     Raises:
         HTTPException: On missing headers, auth failure, or authorization failure.
     """
-    # Validate required headers are present
-    if not x_tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-Tenant-ID",
-        )
-    if not x_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-User-ID",
-        )
-    if not x_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-API-Key",
-        )
+    # Validate idempotency key first (before auth to fail fast)
     if not idempotency_key:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Missing required header: Idempotency-Key",
         )
 
-    # Authenticate: verify tenant exists and API key matches
-    tenant = db.query(GatewayTenant).filter(
-        GatewayTenant.tenant_id == x_tenant_id
-    ).first()
-    if not tenant or tenant.api_key != x_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid tenant ID or API key",
-        )
-
-    # Authorize: verify user exists and belongs to tenant
-    user = db.query(GatewayUser).filter(
-        GatewayUser.user_id == x_user_id
-    ).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User not found",
-        )
-    if user.tenant_id != x_tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User does not belong to this tenant",
-        )
-
-    context = TenantContext(
-        tenant_id=x_tenant_id,
-        user_id=x_user_id,
-        tenant=tenant,
-        user=user,
-    )
+    # Use common authentication logic
+    context = _validate_and_authenticate(db, x_tenant_id, x_user_id, x_api_key)
     return context, idempotency_key
 
 
@@ -434,18 +451,20 @@ def bulk_ingest_kpi_points(
             detail=f"KPI '{kpi_id}' not found",
         )
 
+    # Batch fetch existing timestamps to avoid N+1 queries
+    incoming_timestamps = [point.ts for point in request.points]
+    existing_points = db.query(KPIPoint.ts).filter(
+        KPIPoint.tenant_id == context.tenant_id,
+        KPIPoint.kpi_id == kpi_id,
+        KPIPoint.ts.in_(incoming_timestamps),
+    ).all()
+    existing_timestamps = {p.ts for p in existing_points}
+
     inserted = 0
     ignored = 0
 
     for point in request.points:
-        # Check if point already exists
-        existing = db.query(KPIPoint).filter(
-            KPIPoint.tenant_id == context.tenant_id,
-            KPIPoint.kpi_id == kpi_id,
-            KPIPoint.ts == point.ts,
-        ).first()
-
-        if existing:
+        if point.ts in existing_timestamps:
             ignored += 1
         else:
             kpi_point = KPIPoint(
@@ -465,10 +484,16 @@ def bulk_ingest_kpi_points(
 def list_kpis(
     context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
     db: Session = Depends(get_db),
+    limit: int = 100,
+    offset: int = 0,
 ) -> list[KPIResponse]:
-    """List all KPI definitions for the tenant.
+    """List KPI definitions for the tenant with pagination.
 
     Requires member or admin role.
+
+    Args:
+        limit: Maximum number of KPIs to return (default 100, max 500).
+        offset: Number of KPIs to skip (default 0).
     """
     # Check RBAC: admin and member can read KPIs
     if not can_read_kpis(context.user.role):
@@ -477,9 +502,13 @@ def list_kpis(
             detail=f"Role '{context.user.role}' is not authorized to read KPIs",
         )
 
+    # Enforce reasonable limits
+    limit = min(max(1, limit), 500)
+    offset = max(0, offset)
+
     kpis = db.query(KPIDefinition).filter(
         KPIDefinition.tenant_id == context.tenant_id
-    ).all()
+    ).order_by(KPIDefinition.created_at.desc()).offset(offset).limit(limit).all()
     return [KPIResponse.model_validate(kpi) for kpi in kpis]
 
 
@@ -788,7 +817,7 @@ def update_notification_prefs(
         NotificationPref.user_id == context.user_id,
     ).first()
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     if pref:
         pref.daily_brief_enabled = 1 if request.daily_brief_enabled else 0
@@ -862,21 +891,18 @@ def ack_notification(
 
     Only the owner of the notification can acknowledge it.
     """
+    # Filter by tenant_id and user_id in the query to prevent IDOR attacks
+    # and avoid leaking existence of notifications belonging to other users
     notif = db.query(NotificationOutbox).filter(
         NotificationOutbox.id == notification_id,
+        NotificationOutbox.tenant_id == context.tenant_id,
+        NotificationOutbox.user_id == context.user_id,
     ).first()
 
     if not notif:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Notification {notification_id} not found",
-        )
-
-    # Verify ownership
-    if notif.tenant_id != context.tenant_id or notif.user_id != context.user_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="You can only acknowledge your own notifications",
         )
 
     notif.status = "acked"
@@ -1045,19 +1071,20 @@ def run_daily_brief_job(
     }
     payload_json = json.dumps(notification_payload)
 
+    # Batch fetch existing notifications to avoid N+1 queries
+    existing_notifications = db.query(NotificationOutbox.user_id).filter(
+        NotificationOutbox.tenant_id == context.tenant_id,
+        NotificationOutbox.user_id.in_(users_to_notify),
+        NotificationOutbox.notification_type == "daily_brief",
+        NotificationOutbox.notif_date == brief_date,
+    ).all()
+    existing_user_ids = {n.user_id for n in existing_notifications}
+
     notifications_inserted = 0
     notifications_ignored = 0
 
     for user_id in users_to_notify:
-        # Check if notification already exists (UNIQUE constraint)
-        existing_notif = db.query(NotificationOutbox).filter(
-            NotificationOutbox.tenant_id == context.tenant_id,
-            NotificationOutbox.user_id == user_id,
-            NotificationOutbox.notification_type == "daily_brief",
-            NotificationOutbox.notif_date == brief_date,
-        ).first()
-
-        if existing_notif:
+        if user_id in existing_user_ids:
             notifications_ignored += 1
         else:
             notif = NotificationOutbox(
@@ -1160,10 +1187,16 @@ def create_conversation(
 def list_conversations(
     context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
     db: Session = Depends(get_db),
+    limit: int = 50,
+    offset: int = 0,
 ) -> ConversationListResponse:
-    """List conversations for the current user.
+    """List conversations for the current user with pagination.
 
     Only returns conversations owned by this user within this tenant.
+
+    Args:
+        limit: Maximum number of conversations to return (default 50, max 200).
+        offset: Number of conversations to skip (default 0).
     """
     if not can_use_cofounder_chat(context.user.role):
         raise HTTPException(
@@ -1171,10 +1204,14 @@ def list_conversations(
             detail=f"Role '{context.user.role}' is not authorized to use chat",
         )
 
+    # Enforce reasonable limits
+    limit = min(max(1, limit), 200)
+    offset = max(0, offset)
+
     conversations = db.query(Conversation).filter(
         Conversation.tenant_id == context.tenant_id,
         Conversation.user_id == context.user_id,
-    ).order_by(Conversation.created_at.desc()).all()
+    ).order_by(Conversation.created_at.desc()).offset(offset).limit(limit).all()
 
     items = [
         ConversationResponse(
@@ -1375,18 +1412,15 @@ def _route_intent(
 
     # Intent: kpi:<name> (specific KPI summary)
     import re
+    from sqlalchemy import func
     kpi_name_match = re.search(r"kpi:(\S+)", message_lower)
     if kpi_name_match:
         kpi_name = kpi_name_match.group(1)
-        # Find KPI by name (case-insensitive)
-        kpi = db.query(KPIDefinition).filter(
+        # Find KPI by name using case-insensitive database query (more efficient)
+        matching_kpi = db.query(KPIDefinition).filter(
             KPIDefinition.tenant_id == tenant_id,
-        ).all()
-        matching_kpi = None
-        for k in kpi:
-            if k.name.lower() == kpi_name.lower():
-                matching_kpi = k
-                break
+            func.lower(KPIDefinition.name) == kpi_name.lower(),
+        ).first()
 
         if not matching_kpi:
             content = f"KPI '{kpi_name}' not found."
@@ -1414,14 +1448,24 @@ def _route_intent(
             content = "No KPIs defined for your tenant."
             return content, []
 
+        # Batch fetch all latest points to avoid N+1 queries
+        # Using a subquery to get max ts per kpi_id
+        kpi_ids = [kpi.kpi_id for kpi in kpis]
+        all_points = db.query(KPIPoint).filter(
+            KPIPoint.tenant_id == tenant_id,
+            KPIPoint.kpi_id.in_(kpi_ids),
+        ).order_by(KPIPoint.kpi_id, KPIPoint.ts.desc()).all()
+
+        # Group by kpi_id and take the first (latest) for each
+        latest_by_kpi: dict[str, KPIPoint] = {}
+        for point in all_points:
+            if point.kpi_id not in latest_by_kpi:
+                latest_by_kpi[point.kpi_id] = point
+
         content = f"Found {len(kpis)} KPI(s):"
         cards = []
         for kpi in kpis:
-            latest_point = db.query(KPIPoint).filter(
-                KPIPoint.tenant_id == tenant_id,
-                KPIPoint.kpi_id == kpi.kpi_id,
-            ).order_by(KPIPoint.ts.desc()).first()
-
+            latest_point = latest_by_kpi.get(kpi.kpi_id)
             card = {
                 "type": "kpi",
                 "kpi_id": kpi.kpi_id,

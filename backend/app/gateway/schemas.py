@@ -9,6 +9,14 @@ class TenantCreate(BaseModel):
     """Request schema for creating a tenant."""
     name: str = Field(..., min_length=1, max_length=255)
     region: str = Field(..., min_length=1, max_length=50)
+    admin_email: EmailStr = Field(..., description="Email for the bootstrap admin user")
+
+
+class BootstrapAdmin(BaseModel):
+    """Bootstrap admin user created with tenant."""
+    user_id: str
+    email: str
+    role: str
 
 
 class TenantResponse(BaseModel):
@@ -18,6 +26,7 @@ class TenantResponse(BaseModel):
     region: str
     api_key: str
     created_at: datetime
+    admin: BootstrapAdmin
 
     class Config:
         from_attributes = True
