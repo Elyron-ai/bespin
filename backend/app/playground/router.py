@@ -203,6 +203,13 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
                 <div class="status" id="config-status"></div>
             </div>
             <div class="sidebar-section">
+                <h3>Usage (Today)</h3>
+                <div id="usage-panel" style="font-size: 12px; line-height: 1.8;">
+                    <div class="empty-state" style="font-size: 11px; padding: 10px 0;">Configure credentials above</div>
+                </div>
+                <button onclick="loadUsage()" style="margin-top: 8px;">Refresh Usage</button>
+            </div>
+            <div class="sidebar-section">
                 <h3>Conversations</h3>
                 <button onclick="loadConversations()">Refresh</button>
             </div>
@@ -251,6 +258,7 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
 
             if (tenantId && apiKey && userId) {
                 loadConversations();
+                loadUsage();
             }
         });
 
@@ -289,6 +297,7 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
 
             setStatus('config-status', 'Saved! Loading...', 'success');
             loadConversations();
+            loadUsage();
         }
 
         async function loadConversations() {
@@ -317,6 +326,58 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
                 `).join('');
             } catch (e) {
                 setStatus('config-status', 'Network error', 'error');
+            }
+        }
+
+        async function loadUsage() {
+            const usagePanel = document.getElementById('usage-panel');
+            try {
+                const response = await fetch('/v1/usage/daily', { headers: getHeaders() });
+                if (!response.ok) {
+                    usagePanel.innerHTML = '<div style="color: #cc0000; font-size: 11px;">Error loading usage</div>';
+                    return;
+                }
+
+                const data = await response.json();
+                const limits = data.limits;
+
+                // Map activity types to human-readable labels
+                const labels = {
+                    'assistant_query': 'Chat',
+                    'tool_invocation': 'Tools',
+                    'daily_brief_generated': 'Briefs',
+                    'notification_enqueued': 'Notifs'
+                };
+
+                const limitFields = {
+                    'assistant_query': 'assistant_query_daily_limit',
+                    'tool_invocation': 'tool_invocation_daily_limit',
+                    'daily_brief_generated': 'daily_brief_generated_daily_limit',
+                    'notification_enqueued': 'notification_enqueued_daily_limit'
+                };
+
+                let html = '';
+                for (const item of data.usage) {
+                    const label = labels[item.activity_type] || item.activity_type;
+                    const limit = limits[limitFields[item.activity_type]] || 0;
+                    const pct = limit > 0 ? (item.units / limit) * 100 : 0;
+
+                    let color = '#333';
+                    let warning = '';
+                    if (pct >= 100) {
+                        color = '#cc0000';
+                        warning = ' (LIMIT)';
+                    } else if (pct >= 80) {
+                        color = '#cc6600';
+                        warning = ' (!)';
+                    }
+
+                    html += `<div style="color: ${color}">${label}: ${item.units}/${limit}${warning}</div>`;
+                }
+
+                usagePanel.innerHTML = html || '<div>No usage data</div>';
+            } catch (e) {
+                usagePanel.innerHTML = '<div style="color: #cc0000; font-size: 11px;">Network error</div>';
             }
         }
 

@@ -216,6 +216,7 @@ class DailyBriefRunnerResponse(BaseModel):
     brief_created: bool
     notifications_inserted: int
     notifications_ignored: int
+    notifications_suppressed_due_to_quota: int = 0
 
 
 # Conversation schemas
@@ -276,3 +277,35 @@ class ChatResponse(BaseModel):
     request_id: str
     conversation_id: str
     assistant_message: ChatAssistantMessage
+
+
+# Tenant Limits schemas
+class TenantLimitsResponse(BaseModel):
+    """Response schema for tenant limits."""
+    tenant_id: str
+    assistant_query_daily_limit: int
+    tool_invocation_daily_limit: int
+    daily_brief_generated_daily_limit: int
+    notification_enqueued_daily_limit: int
+
+
+class TenantLimitsUpdateRequest(BaseModel):
+    """Request schema for updating tenant limits."""
+    assistant_query_daily_limit: int = Field(..., ge=0)
+    tool_invocation_daily_limit: int = Field(..., ge=0)
+    daily_brief_generated_daily_limit: int = Field(..., ge=0)
+    notification_enqueued_daily_limit: int = Field(..., ge=0)
+
+
+# Usage schemas
+class UsageItem(BaseModel):
+    """A single usage item in the daily usage response."""
+    activity_type: str
+    units: int
+
+
+class DailyUsageResponse(BaseModel):
+    """Response schema for daily usage summary."""
+    date: str
+    limits: TenantLimitsResponse
+    usage: list[UsageItem]

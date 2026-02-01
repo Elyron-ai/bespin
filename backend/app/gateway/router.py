@@ -28,7 +28,19 @@ from app.gateway.models import (
     Message,
     NotificationOutbox,
     NotificationPref,
+    TenantLimit,
     UsageEvent,
+    UsageRollupDaily,
+)
+from app.gateway.quota import (
+    check_quota,
+    create_default_limits,
+    get_remaining_quota,
+    get_today_date_utc,
+    get_usage,
+    increment_usage,
+    ACTIVITY_LIMIT_FIELD,
+    DEFAULT_LIMITS,
 )
 from app.gateway.rbac import (
     can_invoke_tools,
@@ -52,6 +64,7 @@ from app.gateway.schemas import (
     ConversationResponse,
     DailyBriefRunnerRequest,
     DailyBriefRunnerResponse,
+    DailyUsageResponse,
     KPICreate,
     KPILatestResponse,
     KPIPointsBulkRequest,
@@ -63,9 +76,12 @@ from app.gateway.schemas import (
     NotificationPrefRequest,
     NotificationPrefResponse,
     TenantCreate,
+    TenantLimitsResponse,
+    TenantLimitsUpdateRequest,
     TenantResponse,
     ToolInvokeRequest,
     ToolInvokeResponse,
+    UsageItem,
     UserCreate,
     UserResponse,
 )
@@ -212,6 +228,9 @@ def create_tenant(
     )
     db.add(admin_user)
 
+    # Create default tenant limits
+    create_default_limits(db, tenant_id)
+
     db.commit()
     db.refresh(tenant)
     db.refresh(admin_user)
@@ -327,12 +346,17 @@ def invoke_tool(
             request_body=request_body,
         )
         if cached_response is not None:
+            # Idempotent replay - return cached response without consuming quota
             return ToolInvokeResponse(**cached_response)
     except IdempotencyConflictError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         )
+
+    # Check quota (after idempotency check, so replays don't consume quota)
+    today = get_today_date_utc()
+    check_quota(db, context.tenant_id, today, "tool_invocation", requested_units=1)
 
     # Execute tool (with context for context-aware tools)
     tool_context = ToolContext(tenant_id=context.tenant_id, db=db)
@@ -367,6 +391,10 @@ def invoke_tool(
         request_id=request_id,
     )
     db.add(usage_event)
+
+    # Increment usage rollup
+    increment_usage(db, context.tenant_id, today, "tool_invocation", units=1)
+
     db.commit()
 
     # Build response
@@ -618,7 +646,7 @@ def materialize_brief(
     ).first()
 
     if existing_brief:
-        # Brief exists, return it and store idempotency record
+        # Brief exists, return it and store idempotency record (no quota consumed)
         content = json.loads(existing_brief.content_json)
         response = BriefResponse(
             brief_id=existing_brief.brief_id,
@@ -635,6 +663,10 @@ def materialize_brief(
             response=response.model_dump(),
         )
         return response
+
+    # Brief will be newly created - check quota
+    today = get_today_date_utc()
+    check_quota(db, context.tenant_id, today, "daily_brief_generated", requested_units=1)
 
     # Generate brief content
     content = generate_daily_brief(
@@ -681,6 +713,10 @@ def materialize_brief(
         request_id=request_id,
     )
     db.add(usage_event)
+
+    # Increment usage rollup
+    increment_usage(db, context.tenant_id, today, "daily_brief_generated", units=1)
+
     db.commit()
 
     # Build response
@@ -971,6 +1007,9 @@ def run_daily_brief_job(
             detail=str(e),
         )
 
+    # Get today's date for quota checking
+    today = get_today_date_utc()
+
     # Ensure brief exists for this date
     brief_created = False
     existing_brief = db.query(Brief).filter(
@@ -982,6 +1021,9 @@ def run_daily_brief_job(
         brief_id = existing_brief.brief_id
         brief_content = json.loads(existing_brief.content_json)
     else:
+        # Brief will be newly created - check quota
+        check_quota(db, context.tenant_id, today, "daily_brief_generated", requested_units=1)
+
         # Create the brief using the same generator as /v1/briefs/materialize
         brief_content = generate_daily_brief(
             db=db,
@@ -1025,6 +1067,9 @@ def run_daily_brief_job(
             request_id=brief_request_id,
         )
         db.add(usage_event)
+
+        # Increment usage rollup for brief creation
+        increment_usage(db, context.tenant_id, today, "daily_brief_generated", units=1)
 
         brief_created = True
 
@@ -1080,38 +1125,50 @@ def run_daily_brief_job(
     ).all()
     existing_user_ids = {n.user_id for n in existing_notifications}
 
+    # Determine how many new notifications we can insert based on quota
+    users_needing_notification = [uid for uid in users_to_notify if uid not in existing_user_ids]
+    remaining_quota = get_remaining_quota(db, context.tenant_id, today, "notification_enqueued")
+    remaining_quota = max(0, remaining_quota)  # Ensure non-negative
+
     notifications_inserted = 0
-    notifications_ignored = 0
+    notifications_ignored = len(existing_user_ids)
+    notifications_suppressed_due_to_quota = 0
 
-    for user_id in users_to_notify:
-        if user_id in existing_user_ids:
-            notifications_ignored += 1
-        else:
-            notif = NotificationOutbox(
-                tenant_id=context.tenant_id,
-                user_id=user_id,
-                notification_type="daily_brief",
-                notif_date=brief_date,
-                status="queued",
-                payload_json=payload_json,
-                request_id=runner_request_id,
-            )
-            db.add(notif)
-            notifications_inserted += 1
+    for user_id in users_needing_notification:
+        if remaining_quota <= 0:
+            # Quota exhausted, suppress remaining notifications
+            notifications_suppressed_due_to_quota += 1
+            continue
 
-            # Write usage event for each notification
-            usage_event = UsageEvent(
-                tenant_id=context.tenant_id,
-                user_id=context.user_id,
-                activity_type="notification_enqueued",
-                units=1,
-                tool_name="daily_brief",
-                request_id=runner_request_id,
-            )
-            db.add(usage_event)
+        notif = NotificationOutbox(
+            tenant_id=context.tenant_id,
+            user_id=user_id,
+            notification_type="daily_brief",
+            notif_date=brief_date,
+            status="queued",
+            payload_json=payload_json,
+            request_id=runner_request_id,
+        )
+        db.add(notif)
+        notifications_inserted += 1
+        remaining_quota -= 1
+
+        # Write usage event for each notification
+        usage_event = UsageEvent(
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            activity_type="notification_enqueued",
+            units=1,
+            tool_name="daily_brief",
+            request_id=runner_request_id,
+        )
+        db.add(usage_event)
+
+        # Increment usage rollup for each notification
+        increment_usage(db, context.tenant_id, today, "notification_enqueued", units=1)
 
     # Write a single audit log for the enqueue action
-    if notifications_inserted > 0 or notifications_ignored > 0:
+    if notifications_inserted > 0 or notifications_ignored > 0 or notifications_suppressed_due_to_quota > 0:
         audit_log = AuditLog(
             tenant_id=context.tenant_id,
             user_id=context.user_id,
@@ -1130,6 +1187,7 @@ def run_daily_brief_job(
         brief_created=brief_created,
         notifications_inserted=notifications_inserted,
         notifications_ignored=notifications_ignored,
+        notifications_suppressed_due_to_quota=notifications_suppressed_due_to_quota,
     )
 
     # Store idempotency record
@@ -1500,6 +1558,10 @@ def cofounder_chat(
             detail=f"Role '{context.user.role}' is not authorized to use chat",
         )
 
+    # Check quota before making any state changes
+    today = get_today_date_utc()
+    check_quota(db, context.tenant_id, today, "assistant_query", requested_units=1)
+
     now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     request_id = str(uuid.uuid4())
 
@@ -1584,6 +1646,9 @@ def cofounder_chat(
     )
     db.add(usage_event)
 
+    # Increment usage rollup
+    increment_usage(db, context.tenant_id, today, "assistant_query", units=1)
+
     db.commit()
 
     return ChatResponse(
@@ -1594,4 +1659,148 @@ def cofounder_chat(
             content=assistant_content,
             cards=assistant_cards,
         ),
+    )
+
+
+# --- Tenant Limits Endpoints ---
+
+
+@router.get("/limits", response_model=TenantLimitsResponse)
+def get_limits(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> TenantLimitsResponse:
+    """Get the current tenant's daily limits.
+
+    Accessible by all authenticated users (admin and member).
+    """
+    tenant_limit = db.query(TenantLimit).filter(
+        TenantLimit.tenant_id == context.tenant_id
+    ).first()
+
+    if tenant_limit:
+        return TenantLimitsResponse(
+            tenant_id=context.tenant_id,
+            assistant_query_daily_limit=tenant_limit.assistant_query_daily_limit,
+            tool_invocation_daily_limit=tenant_limit.tool_invocation_daily_limit,
+            daily_brief_generated_daily_limit=tenant_limit.daily_brief_generated_daily_limit,
+            notification_enqueued_daily_limit=tenant_limit.notification_enqueued_daily_limit,
+        )
+
+    # Return defaults if no tenant_limits row exists
+    return TenantLimitsResponse(
+        tenant_id=context.tenant_id,
+        assistant_query_daily_limit=DEFAULT_LIMITS["assistant_query_daily_limit"],
+        tool_invocation_daily_limit=DEFAULT_LIMITS["tool_invocation_daily_limit"],
+        daily_brief_generated_daily_limit=DEFAULT_LIMITS["daily_brief_generated_daily_limit"],
+        notification_enqueued_daily_limit=DEFAULT_LIMITS["notification_enqueued_daily_limit"],
+    )
+
+
+@router.put("/limits", response_model=TenantLimitsResponse)
+def update_limits(
+    request: TenantLimitsUpdateRequest,
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+) -> TenantLimitsResponse:
+    """Update the current tenant's daily limits.
+
+    Requires admin role.
+    """
+    # Check RBAC: only admins can update limits
+    if context.user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Role '{context.user.role}' is not authorized to update limits",
+        )
+
+    tenant_limit = db.query(TenantLimit).filter(
+        TenantLimit.tenant_id == context.tenant_id
+    ).first()
+
+    now = datetime.now(timezone.utc)
+
+    if tenant_limit:
+        tenant_limit.assistant_query_daily_limit = request.assistant_query_daily_limit
+        tenant_limit.tool_invocation_daily_limit = request.tool_invocation_daily_limit
+        tenant_limit.daily_brief_generated_daily_limit = request.daily_brief_generated_daily_limit
+        tenant_limit.notification_enqueued_daily_limit = request.notification_enqueued_daily_limit
+        tenant_limit.updated_at = now
+    else:
+        tenant_limit = TenantLimit(
+            tenant_id=context.tenant_id,
+            assistant_query_daily_limit=request.assistant_query_daily_limit,
+            tool_invocation_daily_limit=request.tool_invocation_daily_limit,
+            daily_brief_generated_daily_limit=request.daily_brief_generated_daily_limit,
+            notification_enqueued_daily_limit=request.notification_enqueued_daily_limit,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(tenant_limit)
+
+    db.commit()
+    db.refresh(tenant_limit)
+
+    return TenantLimitsResponse(
+        tenant_id=context.tenant_id,
+        assistant_query_daily_limit=tenant_limit.assistant_query_daily_limit,
+        tool_invocation_daily_limit=tenant_limit.tool_invocation_daily_limit,
+        daily_brief_generated_daily_limit=tenant_limit.daily_brief_generated_daily_limit,
+        notification_enqueued_daily_limit=tenant_limit.notification_enqueued_daily_limit,
+    )
+
+
+# --- Usage Endpoints ---
+
+
+@router.get("/usage/daily", response_model=DailyUsageResponse)
+def get_daily_usage(
+    context: Annotated[TenantContext, Depends(get_basic_tenant_context)],
+    db: Session = Depends(get_db),
+    date: str | None = None,
+) -> DailyUsageResponse:
+    """Get daily usage summary for the tenant.
+
+    Accessible by all authenticated users (admin and member).
+
+    Args:
+        date: Optional date in YYYY-MM-DD format. Defaults to today UTC.
+    """
+    # Default to today if date not provided
+    if date is None:
+        date = get_today_date_utc()
+
+    # Get tenant limits
+    tenant_limit = db.query(TenantLimit).filter(
+        TenantLimit.tenant_id == context.tenant_id
+    ).first()
+
+    if tenant_limit:
+        limits = TenantLimitsResponse(
+            tenant_id=context.tenant_id,
+            assistant_query_daily_limit=tenant_limit.assistant_query_daily_limit,
+            tool_invocation_daily_limit=tenant_limit.tool_invocation_daily_limit,
+            daily_brief_generated_daily_limit=tenant_limit.daily_brief_generated_daily_limit,
+            notification_enqueued_daily_limit=tenant_limit.notification_enqueued_daily_limit,
+        )
+    else:
+        limits = TenantLimitsResponse(
+            tenant_id=context.tenant_id,
+            assistant_query_daily_limit=DEFAULT_LIMITS["assistant_query_daily_limit"],
+            tool_invocation_daily_limit=DEFAULT_LIMITS["tool_invocation_daily_limit"],
+            daily_brief_generated_daily_limit=DEFAULT_LIMITS["daily_brief_generated_daily_limit"],
+            notification_enqueued_daily_limit=DEFAULT_LIMITS["notification_enqueued_daily_limit"],
+        )
+
+    # Get usage for each activity type
+    activity_types = ["assistant_query", "tool_invocation", "daily_brief_generated", "notification_enqueued"]
+    usage = []
+    for activity_type in activity_types:
+        units = get_usage(db, context.tenant_id, date, activity_type)
+        usage.append(UsageItem(activity_type=activity_type, units=units))
+
+    return DailyUsageResponse(
+        date=date,
+        limits=limits,
+        usage=usage,
     )

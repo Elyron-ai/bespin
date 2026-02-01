@@ -39,6 +39,14 @@ A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 - Audit logging and usage metering for every chat request
 - Playground UI for interactive testing
 
+### Item 6: Tenant Limits + Quota Enforcement + Usage Ledger
+- Per-tenant daily quotas for key activity types
+- Inline quota enforcement on chat, tools/invoke, briefs, and job runner
+- Daily usage rollup table for efficient quota checking
+- Limits and usage summary API endpoints
+- Usage panel in Playground UI with warning indicators
+- Idempotent replays do NOT consume quota
+
 ## Quick Start
 
 ```bash
@@ -58,6 +66,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_phase0_item3.sh   # Daily Briefs smoke test
 ./scripts/smoke_phase0_item4.sh   # Notifications + Runner smoke test
 ./scripts/smoke_phase0_item5.sh   # Cofounder Chat smoke test
+./scripts/smoke_phase0_item6.sh   # Quota Enforcement smoke test
 ```
 
 ## API Overview
@@ -83,6 +92,9 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `GET /v1/conversations` | List user's conversations |
 | `GET /v1/conversations/{id}` | Get conversation with messages |
 | `POST /v1/cofounder/chat` | Send message to Cofounder assistant |
+| `GET /v1/limits` | Get tenant's daily quota limits |
+| `PUT /v1/limits` | Update tenant's daily quota limits (admin only) |
+| `GET /v1/usage/daily` | Get daily usage summary for the tenant |
 | `GET /ui` | Playground UI (requires PLAYGROUND_UI_ENABLED=1) |
 
 See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
@@ -214,6 +226,65 @@ curl -X POST http://localhost:8000/v1/cofounder/chat \
   -d '{"conversation_id": "...", "message": "kpis"}'
 ```
 
+## Quota Enforcement
+
+Bespin enforces per-tenant daily quotas on key activity types to manage usage and prevent abuse.
+
+### Activity Types and Default Limits
+
+| Activity Type | Default Daily Limit | Enforced On |
+|---------------|---------------------|-------------|
+| `assistant_query` | 100 | `/v1/cofounder/chat` |
+| `tool_invocation` | 100 | `/v1/tools/invoke` |
+| `daily_brief_generated` | 10 | `/v1/briefs/materialize`, `/v1/jobs/daily-brief` |
+| `notification_enqueued` | 500 | `/v1/jobs/daily-brief` |
+
+### Quota Behavior
+
+- When quota is exceeded, the endpoint returns HTTP 429 with structured error:
+  ```json
+  {
+    "error": "quota_exceeded",
+    "activity_type": "assistant_query",
+    "limit": 100,
+    "current": 100,
+    "requested": 1
+  }
+  ```
+
+- **Idempotent replays do NOT consume quota**: When using the same `Idempotency-Key` for tool invocation or daily brief, replays return the cached response without incrementing usage.
+
+- **Partial notification enqueue**: The daily-brief runner will insert as many notifications as quota allows and report `notifications_suppressed_due_to_quota` for the rest.
+
+### Managing Limits
+
+```bash
+# Get current limits
+curl http://localhost:8000/v1/limits \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+
+# Update limits (admin only)
+curl -X PUT http://localhost:8000/v1/limits \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "assistant_query_daily_limit": 200,
+    "tool_invocation_daily_limit": 200,
+    "daily_brief_generated_daily_limit": 20,
+    "notification_enqueued_daily_limit": 1000
+  }'
+
+# Get daily usage summary
+curl http://localhost:8000/v1/usage/daily \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+```
+
 ## Tech Stack
 
 - Python 3.12+
@@ -236,7 +307,8 @@ bespin/
 │   │   │   ├── tools.py         # Tool registry
 │   │   │   ├── rbac.py          # Access control
 │   │   │   ├── idempotency.py   # Idempotency handling
-│   │   │   └── briefs.py        # Brief generation logic
+│   │   │   ├── briefs.py        # Brief generation logic
+│   │   │   └── quota.py         # Quota enforcement module
 │   │   ├── console/             # Dev Console UI
 │   │   │   └── router.py        # Console endpoints
 │   │   └── playground/          # Playground UI
@@ -247,5 +319,6 @@ bespin/
     ├── smoke_phase0.sh          # KPI Store smoke test
     ├── smoke_phase0_item3.sh    # Daily Briefs smoke test
     ├── smoke_phase0_item4.sh    # Notifications + Runner smoke test
-    └── smoke_phase0_item5.sh    # Cofounder Chat smoke test
+    ├── smoke_phase0_item5.sh    # Cofounder Chat smoke test
+    └── smoke_phase0_item6.sh    # Quota Enforcement smoke test
 ```
