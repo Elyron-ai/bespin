@@ -16,6 +16,7 @@ class Permission(str, Enum):
     BRIEF_MATERIALIZE = "brief_materialize"  # Materialize daily briefs
     BRIEF_READ = "brief_read"  # Read daily briefs
     RUN_JOBS = "run_jobs"  # Run background jobs (e.g., daily brief runner)
+    COFOUNDER_CHAT = "cofounder_chat"  # Use the cofounder chat
 
 
 # Role to permissions mapping
@@ -27,8 +28,13 @@ ROLE_PERMISSIONS: dict[Role, set[Permission]] = {
         Permission.BRIEF_MATERIALIZE,
         Permission.BRIEF_READ,
         Permission.RUN_JOBS,
+        Permission.COFOUNDER_CHAT,
     },
-    Role.MEMBER: {Permission.KPI_READ, Permission.BRIEF_READ},  # Members can read KPIs and briefs
+    Role.MEMBER: {
+        Permission.KPI_READ,
+        Permission.BRIEF_READ,
+        Permission.COFOUNDER_CHAT,
+    },  # Members can read KPIs, briefs, and use chat
 }
 
 
@@ -119,3 +125,15 @@ def can_run_jobs(role: str) -> bool:
         True if the role can run jobs, False otherwise.
     """
     return has_permission(role, Permission.RUN_JOBS)
+
+
+def can_use_cofounder_chat(role: str) -> bool:
+    """Check if a role can use the cofounder chat.
+
+    Args:
+        role: The user's role as a string.
+
+    Returns:
+        True if the role can use chat, False otherwise.
+    """
+    return has_permission(role, Permission.COFOUNDER_CHAT)

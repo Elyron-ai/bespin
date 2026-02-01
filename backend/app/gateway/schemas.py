@@ -207,3 +207,63 @@ class DailyBriefRunnerResponse(BaseModel):
     brief_created: bool
     notifications_inserted: int
     notifications_ignored: int
+
+
+# Conversation schemas
+class ConversationCreate(BaseModel):
+    """Request schema for creating a conversation."""
+    title: str | None = None
+
+
+class ConversationResponse(BaseModel):
+    """Response schema for a conversation."""
+    conversation_id: str
+    title: str | None
+    created_at: str
+
+    class Config:
+        from_attributes = True
+
+
+class ConversationListResponse(BaseModel):
+    """Response schema for listing conversations."""
+    items: list[ConversationResponse]
+
+
+class MessageResponse(BaseModel):
+    """Response schema for a message."""
+    message_id: str
+    role: str
+    content: str
+    cards: list[dict[str, Any]]
+    created_at: str
+
+
+class ConversationDetailResponse(BaseModel):
+    """Response schema for conversation detail with messages."""
+    conversation_id: str
+    title: str | None
+    created_at: str
+    messages: list[MessageResponse]
+
+
+# Chat schemas
+class ChatRequest(BaseModel):
+    """Request schema for cofounder chat."""
+    conversation_id: str | None = None
+    message: str = Field(..., min_length=1, max_length=4000)
+    date: str | None = Field(None, description="YYYY-MM-DD for date-specific queries")
+
+
+class ChatAssistantMessage(BaseModel):
+    """Assistant message in chat response."""
+    message_id: str
+    content: str
+    cards: list[dict[str, Any]]
+
+
+class ChatResponse(BaseModel):
+    """Response schema for cofounder chat."""
+    request_id: str
+    conversation_id: str
+    assistant_message: ChatAssistantMessage

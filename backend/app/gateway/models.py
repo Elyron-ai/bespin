@@ -158,3 +158,36 @@ class NotificationOutbox(Base):
         ),
         Index("ix_notification_outbox_tenant_user_date", "tenant_id", "user_id", "notif_date"),
     )
+
+
+class Conversation(Base):
+    """Conversation for the Cofounder chat."""
+    __tablename__ = "conversations"
+
+    conversation_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
+    title = Column(String(255), nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601 datetime string
+
+    __table_args__ = (
+        Index("ix_conversations_tenant_user_created", "tenant_id", "user_id", "created_at"),
+    )
+
+
+class Message(Base):
+    """Message within a conversation."""
+    __tablename__ = "messages"
+
+    message_id = Column(String(36), primary_key=True)
+    conversation_id = Column(String(36), nullable=False)
+    tenant_id = Column(String(36), nullable=False)
+    user_id = Column(String(36), nullable=False)
+    role = Column(String(20), nullable=False)  # "user" | "assistant"
+    content = Column(Text, nullable=False)
+    metadata_json = Column(Text, nullable=False)  # JSON string (e.g. cards)
+    created_at = Column(String(30), nullable=False)  # ISO 8601 datetime string
+
+    __table_args__ = (
+        Index("ix_messages_tenant_conversation_created", "tenant_id", "conversation_id", "created_at"),
+    )
