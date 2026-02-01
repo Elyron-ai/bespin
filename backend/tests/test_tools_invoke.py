@@ -3050,3 +3050,452 @@ class TestConversationAutoTitle:
         )
         # Title should be truncated to 40 chars
         assert conv.json()["title"] == "What are my top performing KPIs this wee"
+
+
+class TestTenantLimitsCreation:
+    """Tests for tenant limits creation on tenant creation."""
+
+    def test_tenant_creation_creates_default_limits(self, client):
+        """Test that tenant creation also creates tenant_limits with defaults."""
+        from app.gateway.models import TenantLimit
+
+        # Create a tenant
+        response = client.post(
+            "/v1/tenants",
+            json={"name": "Limits Test Tenant", "region": "us-east-1", "admin_email": "admin@limits.com"},
+        )
+        assert response.status_code == 201
+        tenant_data = response.json()
+        tenant_id = tenant_data["tenant_id"]
+
+        # Verify limits were created
+        limits_response = client.get(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant_id,
+                "X-User-ID": tenant_data["admin"]["user_id"],
+                "X-API-Key": tenant_data["api_key"],
+            },
+        )
+        assert limits_response.status_code == 200
+        limits = limits_response.json()
+
+        # Check default values
+        assert limits["tenant_id"] == tenant_id
+        assert limits["assistant_query_daily_limit"] == 100
+        assert limits["tool_invocation_daily_limit"] == 100
+        assert limits["daily_brief_generated_daily_limit"] == 10
+        assert limits["notification_enqueued_daily_limit"] == 500
+
+
+class TestQuotaEnforcementChat:
+    """Tests for quota enforcement on /v1/cofounder/chat endpoint."""
+
+    def test_chat_quota_enforcement(self, client, tenant, admin_user):
+        """Test that chat quota is enforced - second request fails with 429."""
+        # Set a very low limit
+        update_response = client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 1,
+                "tool_invocation_daily_limit": 100,
+                "daily_brief_generated_daily_limit": 10,
+                "notification_enqueued_daily_limit": 500,
+            },
+        )
+        assert update_response.status_code == 200
+
+        # First chat should succeed
+        response1 = client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "hello"},
+        )
+        assert response1.status_code == 200
+
+        # Second chat should fail with 429
+        response2 = client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "hello again"},
+        )
+        assert response2.status_code == 429
+        error_data = response2.json()["detail"]
+        assert error_data["error"] == "quota_exceeded"
+        assert error_data["activity_type"] == "assistant_query"
+        assert error_data["limit"] == 1
+        assert error_data["current"] == 1
+        assert error_data["requested"] == 1
+
+    def test_chat_quota_no_events_on_rejection(self, client, tenant, admin_user):
+        """Test that no audit_logs or usage_events are written when quota is exceeded."""
+        # Set a very low limit
+        client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 1,
+                "tool_invocation_daily_limit": 100,
+                "daily_brief_generated_daily_limit": 10,
+                "notification_enqueued_daily_limit": 500,
+            },
+        )
+
+        # First chat succeeds
+        client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "hello"},
+        )
+
+        # Second chat fails
+        client.post(
+            "/v1/cofounder/chat",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={"message": "hello again"},
+        )
+
+        # Check usage - should show exactly 1 unit used
+        usage_response = client.get(
+            "/v1/usage/daily",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert usage_response.status_code == 200
+        usage = usage_response.json()
+        chat_usage = next(u for u in usage["usage"] if u["activity_type"] == "assistant_query")
+        assert chat_usage["units"] == 1  # Only the successful one
+
+
+class TestQuotaEnforcementToolsInvoke:
+    """Tests for quota enforcement on /v1/tools/invoke endpoint."""
+
+    def test_tools_invoke_quota_enforcement(self, client, tenant, admin_user):
+        """Test that tool invocation quota is enforced."""
+        # Set a very low limit
+        client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 100,
+                "tool_invocation_daily_limit": 1,
+                "daily_brief_generated_daily_limit": 10,
+                "notification_enqueued_daily_limit": 500,
+            },
+        )
+
+        # First invoke should succeed
+        response1 = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "first-invoke-key",
+            },
+            json={"tool_name": "echo", "payload": {"message": "test1"}},
+        )
+        assert response1.status_code == 200
+
+        # Second invoke with different key should fail with 429
+        response2 = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "second-invoke-key",
+            },
+            json={"tool_name": "echo", "payload": {"message": "test2"}},
+        )
+        assert response2.status_code == 429
+
+    def test_tools_invoke_idempotency_replay_no_quota_consumed(self, client, tenant, admin_user):
+        """Test that idempotent replay returns 200 and does NOT consume quota."""
+        # Set a very low limit
+        client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 100,
+                "tool_invocation_daily_limit": 1,
+                "daily_brief_generated_daily_limit": 10,
+                "notification_enqueued_daily_limit": 500,
+            },
+        )
+
+        idempotency_key = "idempotent-invoke-key"
+
+        # First invoke should succeed
+        response1 = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": idempotency_key,
+            },
+            json={"tool_name": "echo", "payload": {"message": "test"}},
+        )
+        assert response1.status_code == 200
+        original_response = response1.json()
+
+        # Replay with SAME key should succeed (idempotent replay)
+        response2 = client.post(
+            "/v1/tools/invoke",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": idempotency_key,
+            },
+            json={"tool_name": "echo", "payload": {"message": "test"}},
+        )
+        assert response2.status_code == 200
+        replay_response = response2.json()
+
+        # Responses should be the same (cached)
+        assert original_response == replay_response
+
+        # Verify only 1 unit was consumed
+        usage_response = client.get(
+            "/v1/usage/daily",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        tool_usage = next(u for u in usage_response.json()["usage"] if u["activity_type"] == "tool_invocation")
+        assert tool_usage["units"] == 1  # Only the first call consumed quota
+
+
+class TestQuotaEnforcementDailyBrief:
+    """Tests for quota enforcement on daily brief runner with partial notification enqueue."""
+
+    def test_runner_partial_notification_enqueue(self, client, tenant, admin_user, member_user):
+        """Test that notification enqueue is partial when quota is limited."""
+        # Create a second member to have two users to notify
+        client.post(
+            "/v1/users",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "tenant_id": tenant["tenant_id"],
+                "email": "member2@test.com",
+                "role": "member",
+            },
+        )
+
+        # Set notification limit to 1 (so only 1 of 3 users can be notified)
+        # Note: admin + member + member2 = 3 users with default prefs enabled
+        client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 100,
+                "tool_invocation_daily_limit": 100,
+                "daily_brief_generated_daily_limit": 10,
+                "notification_enqueued_daily_limit": 1,
+            },
+        )
+
+        # Run daily brief job
+        response = client.post(
+            "/v1/jobs/daily-brief",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+                "Idempotency-Key": "daily-brief-run-key",
+            },
+            json={},
+        )
+        assert response.status_code == 200
+        result = response.json()
+
+        # Brief should be created
+        assert result["brief_created"] is True
+
+        # Should have inserted 1 notification and suppressed 2 due to quota
+        assert result["notifications_inserted"] == 1
+        assert result["notifications_suppressed_due_to_quota"] == 2
+        assert result["notifications_ignored"] == 0
+
+        # Verify usage shows exactly 1 notification enqueued
+        usage_response = client.get(
+            "/v1/usage/daily",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        notif_usage = next(u for u in usage_response.json()["usage"] if u["activity_type"] == "notification_enqueued")
+        assert notif_usage["units"] == 1
+
+
+class TestUsageRollups:
+    """Tests for usage rollups incrementation."""
+
+    def test_usage_rollups_increment_correctly(self, client, tenant, admin_user):
+        """Test that usage_rollups_daily increments correctly for usage_events."""
+        # Make 3 chat requests
+        for i in range(3):
+            client.post(
+                "/v1/cofounder/chat",
+                headers={
+                    "X-Tenant-ID": tenant["tenant_id"],
+                    "X-User-ID": admin_user["user_id"],
+                    "X-API-Key": tenant["api_key"],
+                },
+                json={"message": f"hello {i}"},
+            )
+
+        # Check usage
+        usage_response = client.get(
+            "/v1/usage/daily",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert usage_response.status_code == 200
+        usage = usage_response.json()
+
+        chat_usage = next(u for u in usage["usage"] if u["activity_type"] == "assistant_query")
+        assert chat_usage["units"] == 3
+
+
+class TestLimitsEndpoints:
+    """Tests for the /v1/limits endpoints."""
+
+    def test_get_limits(self, client, tenant, admin_user):
+        """Test GET /v1/limits returns tenant limits."""
+        response = client.get(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["tenant_id"] == tenant["tenant_id"]
+        assert "assistant_query_daily_limit" in data
+
+    def test_update_limits_admin_only(self, client, tenant, admin_user, member_user):
+        """Test PUT /v1/limits requires admin role."""
+        # Admin can update
+        admin_response = client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 50,
+                "tool_invocation_daily_limit": 50,
+                "daily_brief_generated_daily_limit": 5,
+                "notification_enqueued_daily_limit": 200,
+            },
+        )
+        assert admin_response.status_code == 200
+
+        # Member cannot update
+        member_response = client.put(
+            "/v1/limits",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": member_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+            json={
+                "assistant_query_daily_limit": 50,
+                "tool_invocation_daily_limit": 50,
+                "daily_brief_generated_daily_limit": 5,
+                "notification_enqueued_daily_limit": 200,
+            },
+        )
+        assert member_response.status_code == 403
+
+
+class TestUsageDailyEndpoint:
+    """Tests for the /v1/usage/daily endpoint."""
+
+    def test_get_daily_usage(self, client, tenant, admin_user):
+        """Test GET /v1/usage/daily returns usage summary."""
+        response = client.get(
+            "/v1/usage/daily",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert "date" in data
+        assert "limits" in data
+        assert "usage" in data
+        assert len(data["usage"]) == 4  # 4 activity types
+
+    def test_get_daily_usage_with_date_param(self, client, tenant, admin_user):
+        """Test GET /v1/usage/daily with specific date."""
+        response = client.get(
+            "/v1/usage/daily?date=2025-01-01",
+            headers={
+                "X-Tenant-ID": tenant["tenant_id"],
+                "X-User-ID": admin_user["user_id"],
+                "X-API-Key": tenant["api_key"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["date"] == "2025-01-01"

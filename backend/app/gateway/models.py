@@ -198,3 +198,31 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_tenant_conversation_created", "tenant_id", "conversation_id", "created_at"),
     )
+
+
+class TenantLimit(Base):
+    """Per-tenant daily quota limits for various activity types."""
+    __tablename__ = "tenant_limits"
+
+    tenant_id = Column(String(36), primary_key=True)
+    assistant_query_daily_limit = Column(Integer, nullable=False, default=100)
+    tool_invocation_daily_limit = Column(Integer, nullable=False, default=100)
+    daily_brief_generated_daily_limit = Column(Integer, nullable=False, default=10)
+    notification_enqueued_daily_limit = Column(Integer, nullable=False, default=500)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+
+class UsageRollupDaily(Base):
+    """Daily usage rollup for efficient quota checking."""
+    __tablename__ = "usage_rollups_daily"
+
+    tenant_id = Column(String(36), nullable=False, primary_key=True)
+    rollup_date = Column(String(10), nullable=False, primary_key=True)  # YYYY-MM-DD
+    activity_type = Column(String(100), nullable=False, primary_key=True)
+    units = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
+
+    __table_args__ = (
+        Index("ix_usage_rollups_tenant_date", "tenant_id", "rollup_date"),
+    )
