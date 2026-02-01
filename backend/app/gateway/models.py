@@ -1,7 +1,12 @@
 """Database models for the Tool Invocation Gateway."""
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, String, Integer, Text, DateTime, Float, Index, UniqueConstraint
 from app.database import Base
+
+
+def utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
 
 
 class GatewayTenant(Base):
@@ -12,7 +17,7 @@ class GatewayTenant(Base):
     name = Column(String(255), nullable=False)
     region = Column(String(50), nullable=False)
     api_key = Column(String(64), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 class GatewayUser(Base):
@@ -23,7 +28,7 @@ class GatewayUser(Base):
     tenant_id = Column(String(36), nullable=False, index=True)
     email = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False)  # "admin" or "member"
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 class AuditLog(Base):
@@ -36,7 +41,7 @@ class AuditLog(Base):
     action = Column(String(100), nullable=False)
     tool_name = Column(String(100), nullable=True)
     request_id = Column(String(36), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 class UsageEvent(Base):
@@ -50,7 +55,7 @@ class UsageEvent(Base):
     units = Column(Integer, nullable=False, default=1)
     tool_name = Column(String(100), nullable=True)
     request_id = Column(String(36), nullable=False, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
 
 class IdempotencyKey(Base):
@@ -63,13 +68,15 @@ class IdempotencyKey(Base):
     idempotency_key = Column(String(255), nullable=False)
     request_hash = Column(String(64), nullable=False)  # SHA-256 hex
     response_json = Column(Text, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(
             "tenant_id", "endpoint", "idempotency_key",
             name="uq_idempotency_tenant_endpoint_key"
         ),
+        # Index for efficient lookups by tenant_id, endpoint, and idempotency_key
+        Index("ix_idempotency_tenant_endpoint_key", "tenant_id", "endpoint", "idempotency_key"),
     )
 
 
@@ -82,7 +89,7 @@ class KPIDefinition(Base):
     name = Column(String(255), nullable=False)
     unit = Column(String(50), nullable=True)
     description = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
         Index("ix_kpi_definitions_tenant_name", "tenant_id", "name"),
@@ -98,7 +105,7 @@ class KPIPoint(Base):
     kpi_id = Column(String(36), nullable=False)
     ts = Column(String(30), nullable=False)  # ISO 8601 datetime string
     value = Column(Float, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "kpi_id", "ts", name="uq_kpi_point_tenant_kpi_ts"),
@@ -117,7 +124,7 @@ class Brief(Base):
     top_n = Column(Integer, nullable=False)
     content_json = Column(Text, nullable=False)  # JSON string
     request_id = Column(String(36), nullable=False)  # UUID for audit/usage correlation
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "brief_date", name="uq_brief_tenant_date"),
@@ -133,8 +140,8 @@ class NotificationPref(Base):
     user_id = Column(String(36), nullable=False, primary_key=True)
     daily_brief_enabled = Column(Integer, nullable=False, default=1)  # 0 or 1
     delivery_method = Column(String(50), nullable=False, default="in_app")
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
+    updated_at = Column(DateTime, default=utc_now, onupdate=utc_now, nullable=False)
 
 
 class NotificationOutbox(Base):
@@ -149,7 +156,7 @@ class NotificationOutbox(Base):
     status = Column(String(20), nullable=False)  # "queued" | "acked"
     payload_json = Column(Text, nullable=False)  # JSON string
     request_id = Column(String(36), nullable=False)  # UUID correlation
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=utc_now, nullable=False)
 
     __table_args__ = (
         UniqueConstraint(

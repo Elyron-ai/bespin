@@ -1,4 +1,5 @@
 """Brief generation logic for the Insight Materializer."""
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -31,8 +32,35 @@ def generate_daily_brief(
         KPIDefinition.tenant_id == tenant_id
     ).all()
 
+    if not kpi_definitions:
+        return {
+            "date": brief_date,
+            "window_days": window_days,
+            "top_n": top_n,
+            "summary": {
+                "kpis_considered": 0,
+                "kpis_up": 0,
+                "kpis_down": 0,
+                "kpis_flat": 0,
+            },
+            "highlights": [],
+            "alerts": [],
+        }
+
     # Calculate the end of day boundary for brief_date
     end_ts = f"{brief_date}T23:59:59Z"
+
+    # Batch fetch all KPI points for this tenant up to end_ts
+    # This eliminates N+1 query problem by fetching all points in one query
+    all_points = db.query(KPIPoint).filter(
+        KPIPoint.tenant_id == tenant_id,
+        KPIPoint.ts <= end_ts,
+    ).order_by(KPIPoint.kpi_id, KPIPoint.ts.desc()).all()
+
+    # Group points by kpi_id for efficient access
+    points_by_kpi: dict[str, list[KPIPoint]] = defaultdict(list)
+    for point in all_points:
+        points_by_kpi[point.kpi_id].append(point)
 
     # Track stats
     kpi_data = []
@@ -41,16 +69,13 @@ def generate_daily_brief(
     kpis_flat = 0
 
     for kpi_def in kpi_definitions:
-        # Find the latest KPI point with ts <= end_ts
-        latest_point = db.query(KPIPoint).filter(
-            KPIPoint.tenant_id == tenant_id,
-            KPIPoint.kpi_id == kpi_def.kpi_id,
-            KPIPoint.ts <= end_ts,
-        ).order_by(KPIPoint.ts.desc()).first()
-
-        if not latest_point:
+        kpi_points = points_by_kpi.get(kpi_def.kpi_id, [])
+        if not kpi_points:
             # No points for this KPI, skip it
             continue
+
+        # Points are already sorted by ts desc, so first is latest
+        latest_point = kpi_points[0]
 
         # Calculate window_start_ts = latest.ts - window_days days
         # Parse the latest timestamp
@@ -67,17 +92,13 @@ def generate_daily_brief(
         window_start_dt = latest_dt - timedelta(days=window_days)
         window_start_ts = window_start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Find the earliest point within the window
-        start_point = db.query(KPIPoint).filter(
-            KPIPoint.tenant_id == tenant_id,
-            KPIPoint.kpi_id == kpi_def.kpi_id,
-            KPIPoint.ts >= window_start_ts,
-            KPIPoint.ts <= latest_point.ts,
-        ).order_by(KPIPoint.ts.asc()).first()
-
-        # If no start point found (shouldn't happen if latest exists), use latest
-        if not start_point:
-            start_point = latest_point
+        # Find the earliest point within the window from our pre-fetched list
+        # Points are sorted desc, so we need to find the last point >= window_start
+        start_point = latest_point
+        for point in reversed(kpi_points):
+            if point.ts >= window_start_ts and point.ts <= latest_point.ts:
+                start_point = point
+                break
 
         # Compute deltas
         delta_abs = latest_point.value - start_point.value

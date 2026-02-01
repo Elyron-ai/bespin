@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
@@ -10,11 +12,21 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Bespin Tool Invocation Gateway", version="0.1.0")
 
+# Configure CORS origins from environment variable
+# In production, set CORS_ORIGINS to a comma-separated list of allowed origins
+# Example: CORS_ORIGINS=https://app.example.com,https://admin.example.com
+cors_origins_env = os.environ.get("CORS_ORIGINS", "")
+if cors_origins_env:
+    cors_origins = [origin.strip() for origin in cors_origins_env.split(",") if origin.strip()]
+else:
+    # Default to localhost origins for development only
+    cors_origins = ["http://localhost:3000", "http://localhost:8000", "http://127.0.0.1:3000", "http://127.0.0.1:8000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
