@@ -18,6 +18,7 @@ from app.gateway.models import (
     NotificationPref,
     UsageEvent,
 )
+from app.gateway.billing_seed import seed_all_billing_data
 
 
 # Create a test database
@@ -47,6 +48,12 @@ app.dependency_overrides[get_db] = override_get_db
 def client():
     """Create test client with fresh database for each test."""
     Base.metadata.create_all(bind=engine)
+    # Seed billing data (plans, metered events, capabilities) for test database
+    db = TestingSessionLocal()
+    try:
+        seed_all_billing_data(db)
+    finally:
+        db.close()
     yield TestClient(app)
     Base.metadata.drop_all(bind=engine)
 

@@ -59,6 +59,11 @@ class UsageEvent(Base):
     request_id = Column(String(36), nullable=False, index=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
 
+    __table_args__ = (
+        # Index for billing ledger queries filtering by tenant and date range
+        Index("ix_usage_events_tenant_created", "tenant_id", "created_at"),
+    )
+
 
 class IdempotencyKey(Base):
     """Idempotency keys to prevent duplicate processing."""

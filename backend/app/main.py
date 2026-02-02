@@ -54,4 +54,20 @@ def read_root():
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    """Health check endpoint that verifies database connectivity."""
+    from sqlalchemy import text
+    try:
+        # Verify database is accessible
+        db = SessionLocal()
+        try:
+            # Execute a simple query to verify connection
+            db.execute(text("SELECT 1"))
+            return {"status": "ok", "database": "connected"}
+        finally:
+            db.close()
+    except Exception as e:
+        from fastapi import HTTPException, status
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"status": "unhealthy", "database": "disconnected", "error": str(e)},
+        )
