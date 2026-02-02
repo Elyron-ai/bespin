@@ -57,6 +57,17 @@ A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 - **Platform Admin APIs**: Manage metered events, plans, and subscriptions
 - **Tenant Billing APIs**: View plan, usage, and ledger
 
+### Item 8: Core Business OS Primitives v0
+- **Action Center**: Proposed actions with approval workflow (propose → approve/reject → execute)
+- **Tasks**: Work OS tasks with assignment, priority, due dates, and completion tracking
+- **Decisions**: Strategic decisions log with rationale and context
+- **Meeting Notes**: Meeting documentation with entity linking
+- **Governed Memory**: Admin-curated facts about the business (ICP, pricing, goals, etc.)
+- **Evidence/Provenance Links**: Link supporting evidence to actions, tasks, decisions, and facts
+- **Unified Timeline**: User-facing "what happened" event stream
+- **Global Search**: Search across all core entities (tenant-scoped)
+- **Record Explorer**: Drilldown view with entity, evidence, and timeline
+
 ## Quick Start
 
 ```bash
@@ -78,6 +89,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_phase0_item5.sh   # Cofounder Chat smoke test
 ./scripts/smoke_phase0_item6.sh   # Quota Enforcement smoke test
 ./scripts/smoke_phase0_item7.sh   # Billing + Metering smoke test
+./scripts/smoke_core_os_v0.sh     # Core Business OS smoke test
 ```
 
 ## API Overview
@@ -120,6 +132,44 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `PUT /v1/admin/plans/{plan_id}/caps` | Set plan event caps (platform admin) |
 | `PUT /v1/admin/tenants/{tenant_id}/subscription` | Update tenant subscription (platform admin) |
 | `GET /ui` | Playground UI (requires PLAYGROUND_UI_ENABLED=1) |
+| `GET /app` | Core Business OS UI (requires PLAYGROUND_UI_ENABLED=1) |
+| **Core Business OS - Actions** | |
+| `POST /v1/actions` | Create action (proposed state) |
+| `GET /v1/actions` | List actions (optional status filter) |
+| `GET /v1/actions/{action_id}` | Get action by ID |
+| `PATCH /v1/actions/{action_id}` | Update action (creator or admin) |
+| `POST /v1/actions/{action_id}/approve` | Approve action (admin only) |
+| `POST /v1/actions/{action_id}/reject` | Reject action (admin only) |
+| `POST /v1/actions/{action_id}/execute` | Execute action (admin only) |
+| **Core Business OS - Tasks** | |
+| `POST /v1/tasks` | Create task |
+| `GET /v1/tasks` | List tasks (optional status, priority, assignee filters) |
+| `GET /v1/tasks/{task_id}` | Get task by ID |
+| `PATCH /v1/tasks/{task_id}` | Update task |
+| `POST /v1/tasks/{task_id}/complete` | Complete task |
+| **Core Business OS - Decisions** | |
+| `POST /v1/decisions` | Create decision (admin only) |
+| `GET /v1/decisions` | List decisions |
+| `GET /v1/decisions/{decision_id}` | Get decision by ID |
+| `PATCH /v1/decisions/{decision_id}` | Update decision (admin only) |
+| **Core Business OS - Meetings** | |
+| `POST /v1/meetings` | Create meeting note |
+| `GET /v1/meetings` | List meetings |
+| `GET /v1/meetings/{meeting_id}` | Get meeting by ID |
+| `PATCH /v1/meetings/{meeting_id}` | Update meeting |
+| **Core Business OS - Memory** | |
+| `POST /v1/memory/facts` | Create fact (admin only) |
+| `GET /v1/memory/facts` | List facts (optional category filter) |
+| `GET /v1/memory/facts/{fact_id}` | Get fact by ID |
+| `PATCH /v1/memory/facts/{fact_id}` | Update fact (admin only) |
+| `POST /v1/memory/facts/{fact_id}/supersede` | Supersede fact (admin only) |
+| **Core Business OS - Evidence** | |
+| `POST /v1/evidence` | Create evidence link |
+| `GET /v1/evidence` | List evidence for entity |
+| **Core Business OS - Timeline & Search** | |
+| `GET /v1/timeline` | Get timeline events (paginated) |
+| `GET /v1/search` | Global search across entities |
+| `GET /v1/records/{entity_type}/{entity_id}` | Record explorer (entity + evidence + timeline) |
 
 See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
 
@@ -331,6 +381,25 @@ export PLATFORM_ADMIN_KEY=your-admin-key
 | `notification_enqueued` | notification | 0.2 | $0.02 | Notification queued |
 | `kpi_definition_created` | kpi | 0.5 | $0.02 | KPI definition created |
 | `kpi_points_ingested` | row | 0.001 | $0.02 | KPI data point ingested |
+| **Core Business OS** | | | | |
+| `action_created` | record | 0.2 | $0.02 | Action created |
+| `action_approved` | event | 0.2 | $0.02 | Action approved |
+| `action_rejected` | event | 0.1 | $0.02 | Action rejected |
+| `action_executed` | event | 0.5 | $0.02 | Action executed |
+| `task_created` | record | 0.1 | $0.02 | Task created |
+| `task_updated` | record | 0.05 | $0.02 | Task updated |
+| `task_completed` | record | 0.1 | $0.02 | Task completed |
+| `decision_created` | record | 0.2 | $0.02 | Decision created |
+| `decision_updated` | record | 0.1 | $0.02 | Decision updated |
+| `meeting_created` | record | 0.15 | $0.02 | Meeting note created |
+| `meeting_updated` | record | 0.05 | $0.02 | Meeting note updated |
+| `memory_fact_created` | record | 0.2 | $0.02 | Memory fact created |
+| `memory_fact_updated` | record | 0.1 | $0.02 | Memory fact updated |
+| `memory_fact_superseded` | record | 0.15 | $0.02 | Memory fact superseded |
+| `evidence_created` | record | 0.1 | $0.02 | Evidence link created |
+| `search_query` | call | 0.05 | $0.02 | Global search query |
+| `timeline_query` | call | 0.02 | $0.02 | Timeline query |
+| `record_explorer_query` | call | 0.05 | $0.02 | Record explorer query |
 
 ### Default Plans
 
@@ -421,6 +490,166 @@ The smoke test demonstrates:
 3. Testing quota enforcement with a limited plan
 4. Running the daily brief job with notification metering
 
+## Core Business OS (Item #8)
+
+The Core Business OS provides primitives for managing business operations: actions, tasks, decisions, meetings, memory, and evidence linking.
+
+### RBAC Rules Summary
+
+| Entity | Create | Read | Update | Delete/Special |
+|--------|--------|------|--------|----------------|
+| **Actions** | Any user | Any user | Creator or admin | Approve/Reject/Execute: admin only |
+| **Tasks** | Any user | Any user | Any user | Complete: assignee or admin |
+| **Decisions** | Admin only | Any user | Admin only | - |
+| **Meetings** | Any user | Any user | Creator or admin | - |
+| **Memory Facts** | Admin only | Any user | Admin only | Supersede: admin only |
+| **Evidence** | Any user | Any user | - | - |
+| **Timeline** | - | Any user | - | Auto-populated |
+| **Search** | - | Any user | - | - |
+
+### Core OS Capabilities
+
+New capabilities added to plans:
+
+| Capability | Description |
+|------------|-------------|
+| `action_center` | Access to Action Center APIs |
+| `tasks` | Access to Tasks APIs |
+| `decisions` | Access to Decisions APIs |
+| `meetings` | Access to Meetings APIs |
+| `memory` | Access to Memory Facts APIs |
+| `timeline` | Access to Timeline APIs |
+| `search` | Access to Global Search APIs |
+
+### Core OS UI
+
+Access the Core Business OS UI at `http://localhost:8000/app` (requires `PLAYGROUND_UI_ENABLED=1`).
+
+Features:
+- **Actions**: Create, view, approve/reject, execute actions
+- **Tasks**: Create, assign, track, complete tasks
+- **Decisions**: Log strategic decisions (admin only)
+- **Meetings**: Document meeting notes
+- **Memory**: Curate business facts (ICP, goals, pricing)
+- **Search**: Global search across all entities
+- **Timeline**: View recent activity stream
+
+### Running the Core OS Smoke Test
+
+```bash
+# Server must be running
+./scripts/smoke_core_os_v0.sh
+```
+
+The smoke test demonstrates:
+1. Creating a tenant with admin and member users
+2. Admin creates memory fact (ICP definition)
+3. Admin creates decision (pricing strategy)
+4. Member creates action (proposed outreach)
+5. Admin approves and executes the action
+6. Admin creates task assigned to member
+7. Member completes the task
+8. Admin creates meeting note
+9. Admin attaches evidence to decision
+10. Member performs global search
+11. Fetching unified timeline
+12. Viewing billing usage for Core OS operations
+
+### Example: Action Workflow
+
+```bash
+# 1. Member proposes an action
+curl -X POST http://localhost:8000/v1/actions \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $MEMBER_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "title": "Follow up with Acme Corp",
+    "description": "Re-engage stalled enterprise deal",
+    "action_type": "outreach",
+    "source": "user",
+    "payload": {"company": "Acme Corp"}
+  }'
+
+# 2. Admin approves the action
+curl -X POST http://localhost:8000/v1/actions/$ACTION_ID/approve \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"comment": "Priority deal - approved"}'
+
+# 3. Admin executes the action
+curl -X POST http://localhost:8000/v1/actions/$ACTION_ID/execute \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"execution_status": "succeeded", "result": {"message": "Email sent"}}'
+```
+
+### Example: Memory Facts (Admin Only)
+
+```bash
+# Create a governed fact
+curl -X POST http://localhost:8000/v1/memory/facts \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "category": "icp",
+    "fact_key": "ICP.primary",
+    "fact_value": "Mid-market SaaS, 50-500 employees, $5M-$50M revenue"
+  }'
+
+# Supersede with updated value
+curl -X POST http://localhost:8000/v1/memory/facts/$FACT_ID/supersede \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{
+    "fact_value": "Mid-market SaaS, 100-1000 employees, $10M-$100M revenue"
+  }'
+```
+
+### Example: Global Search
+
+```bash
+# Search across all entities
+curl "http://localhost:8000/v1/search?q=pricing" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+```
+
+Response:
+```json
+{
+  "query": "pricing",
+  "total": 3,
+  "results": [
+    {"entity_type": "decision", "entity_id": "...", "title": "Q1 Pricing Strategy", "snippet": "...pricing..."},
+    {"entity_type": "task", "entity_id": "...", "title": "Prepare pricing update", "snippet": "...pricing..."},
+    {"entity_type": "memory_fact", "entity_id": "...", "title": "pricing.base", "snippet": "...pricing..."}
+  ]
+}
+```
+
+### Example: Record Explorer
+
+```bash
+# Get entity with evidence and timeline
+curl "http://localhost:8000/v1/records/decision/$DECISION_ID" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+```
+
+Response includes the entity, all evidence links, and related timeline events.
+
 ## Tech Stack
 
 - Python 3.12+
@@ -438,7 +667,7 @@ bespin/
 │   │   ├── database.py          # SQLAlchemy setup
 │   │   ├── gateway/             # Phase 0 implementation
 │   │   │   ├── router.py        # API endpoints
-│   │   │   ├── models.py        # Data models
+│   │   │   ├── models.py        # Data models (incl. Core OS)
 │   │   │   ├── schemas.py       # Request/response schemas
 │   │   │   ├── tools.py         # Tool registry
 │   │   │   ├── rbac.py          # Access control
@@ -449,18 +678,21 @@ bespin/
 │   │   │   ├── billing_seed.py  # Default billing data
 │   │   │   ├── billing_router.py # Admin + tenant billing APIs
 │   │   │   ├── metering.py      # Centralized usage emission
-│   │   │   └── entitlements.py  # Capability + credits quota enforcement
+│   │   │   ├── entitlements.py  # Capability + credits quota enforcement
+│   │   │   └── core_os_router.py # Core Business OS APIs
 │   │   ├── console/             # Dev Console UI
 │   │   │   └── router.py        # Console endpoints
 │   │   └── playground/          # Playground UI
 │   │       └── router.py        # Playground endpoints
 │   └── tests/
-│       └── test_tools_invoke.py # Comprehensive test suite
+│       ├── test_tools_invoke.py # Comprehensive test suite
+│       └── test_core_os.py      # Core Business OS tests
 └── scripts/
     ├── smoke_phase0.sh          # KPI Store smoke test
     ├── smoke_phase0_item3.sh    # Daily Briefs smoke test
     ├── smoke_phase0_item4.sh    # Notifications + Runner smoke test
     ├── smoke_phase0_item5.sh    # Cofounder Chat smoke test
     ├── smoke_phase0_item6.sh    # Quota Enforcement smoke test
-    └── smoke_phase0_item7.sh    # Billing + Metering smoke test
+    ├── smoke_phase0_item7.sh    # Billing + Metering smoke test
+    └── smoke_core_os_v0.sh      # Core Business OS smoke test
 ```

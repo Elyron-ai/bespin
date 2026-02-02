@@ -6,6 +6,7 @@ from app.database import engine, Base, SessionLocal
 from app.gateway import models as gateway_models  # noqa: F401 - import for table creation
 from app.gateway.router import router as gateway_router
 from app.gateway.billing_router import router as billing_router
+from app.gateway.core_os_router import router as core_os_router
 from app.console.router import router as console_router
 from app.playground.router import router as playground_router
 from app.gateway.billing_seed import seed_all_billing_data
@@ -45,6 +46,7 @@ app.add_middleware(
 
 app.include_router(gateway_router)
 app.include_router(billing_router)
+app.include_router(core_os_router)
 app.include_router(console_router)
 app.include_router(playground_router)
 
