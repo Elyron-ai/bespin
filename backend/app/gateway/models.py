@@ -321,3 +321,191 @@ class UsageRollupPeriod(Base):
     __table_args__ = (
         Index("ix_usage_rollups_period_tenant", "tenant_id", "period_start"),
     )
+
+
+# =============================================================================
+# Core Business OS Models
+# =============================================================================
+
+class Action(Base):
+    """Action Center: recommended actions that can be approved/executed."""
+    __tablename__ = "actions"
+
+    action_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    created_by_user_id = Column(String(36), nullable=False)
+    assigned_to_user_id = Column(String(36), nullable=True)
+    source = Column(String(50), nullable=False)  # "user" | "agent" | "system"
+    source_ref = Column(String(255), nullable=True)  # e.g. agent name or run id
+    status = Column(String(50), nullable=False)  # "proposed" | "approved" | "rejected" | "executed" | "cancelled"
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    action_type = Column(String(100), nullable=False)  # e.g. "create_task", "update_record", "draft_content"
+    payload_json = Column(Text, nullable=False)  # JSON string for execution payload
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_actions_tenant_status_created", "tenant_id", "status", "created_at"),
+        Index("ix_actions_tenant_assigned_status", "tenant_id", "assigned_to_user_id", "status"),
+    )
+
+
+class ActionReview(Base):
+    """Review record for an action (approval/rejection)."""
+    __tablename__ = "action_reviews"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(36), nullable=False)
+    action_id = Column(String(36), nullable=False)
+    reviewer_user_id = Column(String(36), nullable=False)
+    decision = Column(String(50), nullable=False)  # "approved" | "rejected"
+    comment = Column(Text, nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_action_reviews_tenant_action_created", "tenant_id", "action_id", "created_at"),
+    )
+
+
+class ActionExecution(Base):
+    """Execution record for an action."""
+    __tablename__ = "action_executions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(36), nullable=False)
+    action_id = Column(String(36), nullable=False)
+    executed_by_user_id = Column(String(36), nullable=False)
+    execution_status = Column(String(50), nullable=False)  # "succeeded" | "failed" | "skipped"
+    result_json = Column(Text, nullable=False)  # JSON string
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_action_executions_tenant_action_created", "tenant_id", "action_id", "created_at"),
+    )
+
+
+class Task(Base):
+    """Work OS: Tasks."""
+    __tablename__ = "tasks"
+
+    task_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    created_by_user_id = Column(String(36), nullable=False)
+    assigned_to_user_id = Column(String(36), nullable=True)
+    status = Column(String(50), nullable=False)  # "todo" | "doing" | "done"
+    priority = Column(String(50), nullable=False)  # "low" | "medium" | "high"
+    due_date = Column(String(10), nullable=True)  # YYYY-MM-DD
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    linked_entity_type = Column(String(100), nullable=True)  # e.g. "action", "decision", "kpi", "brief"
+    linked_entity_id = Column(String(36), nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_tasks_tenant_status_due", "tenant_id", "status", "due_date"),
+        Index("ix_tasks_tenant_assigned_status", "tenant_id", "assigned_to_user_id", "status"),
+    )
+
+
+class MeetingNote(Base):
+    """Work OS: Meeting notes."""
+    __tablename__ = "meeting_notes"
+
+    meeting_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    created_by_user_id = Column(String(36), nullable=False)
+    meeting_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    title = Column(String(255), nullable=False)
+    notes = Column(Text, nullable=False)  # markdown/text
+    linked_entity_type = Column(String(100), nullable=True)
+    linked_entity_id = Column(String(36), nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_meeting_notes_tenant_date", "tenant_id", "meeting_date"),
+    )
+
+
+class Decision(Base):
+    """Strategy OS: Decisions."""
+    __tablename__ = "decisions"
+
+    decision_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    created_by_user_id = Column(String(36), nullable=False)
+    decision_date = Column(String(10), nullable=False)  # YYYY-MM-DD
+    title = Column(String(255), nullable=False)
+    context = Column(Text, nullable=True)
+    decision = Column(Text, nullable=False)
+    rationale = Column(Text, nullable=True)
+    status = Column(String(50), nullable=False)  # "active" | "superseded"
+    superseded_by_decision_id = Column(String(36), nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_decisions_tenant_date", "tenant_id", "decision_date"),
+    )
+
+
+class MemoryFact(Base):
+    """Governed Memory: Facts about the business."""
+    __tablename__ = "memory_facts"
+
+    fact_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    created_by_user_id = Column(String(36), nullable=False)
+    category = Column(String(100), nullable=False)  # "icp" | "positioning" | "pricing" | "goals" | "constraints" | "brand" | "other"
+    fact_key = Column(String(255), nullable=False)  # short key e.g. "ICP.primary"
+    fact_value = Column(Text, nullable=False)  # long text
+    status = Column(String(50), nullable=False)  # "active" | "superseded"
+    supersedes_fact_id = Column(String(36), nullable=True)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "fact_key", "status", name="uq_memory_fact_tenant_key_status"),
+        Index("ix_memory_facts_tenant_category_status", "tenant_id", "category", "status"),
+    )
+
+
+class EvidenceLink(Base):
+    """Evidence / Provenance links for actions, tasks, decisions, memory facts."""
+    __tablename__ = "evidence_links"
+
+    evidence_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    entity_type = Column(String(100), nullable=False)  # "action" | "task" | "decision" | "memory_fact"
+    entity_id = Column(String(36), nullable=False)
+    source_type = Column(String(100), nullable=False)  # "kpi" | "brief" | "note" | "decision" | "task" | "manual"
+    source_ref_json = Column(Text, nullable=False)  # JSON with {table, id, field?, ts?} OR external ref
+    snippet = Column(Text, nullable=True)
+    created_by_user_id = Column(String(36), nullable=False)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_evidence_links_tenant_entity", "tenant_id", "entity_type", "entity_id"),
+    )
+
+
+class TimelineEvent(Base):
+    """Unified Timeline: User-facing 'what happened' stream."""
+    __tablename__ = "timeline_events"
+
+    event_id = Column(String(36), primary_key=True)
+    tenant_id = Column(String(36), nullable=False)
+    actor_user_id = Column(String(36), nullable=False)  # who caused it (or "system")
+    event_type = Column(String(100), nullable=False)  # e.g. "action_created", "task_completed"
+    entity_type = Column(String(100), nullable=False)  # "action" | "task" | "decision" | "memory_fact" | "meeting"
+    entity_id = Column(String(36), nullable=False)
+    summary = Column(Text, nullable=False)
+    metadata_json = Column(Text, nullable=False)  # JSON string
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_timeline_events_tenant_created", "tenant_id", "created_at"),
+        Index("ix_timeline_events_tenant_entity_created", "tenant_id", "entity_type", "entity_id", "created_at"),
+    )

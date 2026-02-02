@@ -609,3 +609,824 @@ def playground_ui() -> str:
     )
 
     return html
+
+
+# Core Business OS UI
+CORE_OS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bespin - Core Business OS</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            min-height: 100vh;
+        }
+        .header {
+            background: #1a1a2e;
+            color: white;
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; }
+        .header-links a { color: #88c8ff; text-decoration: none; font-size: 13px; margin-left: 15px; }
+        .header-links a:hover { text-decoration: underline; }
+        .main { display: flex; min-height: calc(100vh - 50px); }
+        .sidebar {
+            width: 200px;
+            background: white;
+            border-right: 1px solid #ddd;
+            padding: 15px 0;
+        }
+        .sidebar a {
+            display: block;
+            padding: 10px 20px;
+            color: #333;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        .sidebar a:hover { background: #f0f0f0; }
+        .sidebar a.active { background: #e3f2fd; color: #0066cc; font-weight: 500; }
+        .sidebar hr { border: none; border-top: 1px solid #eee; margin: 10px 0; }
+        .content { flex: 1; padding: 20px; overflow-y: auto; }
+        .config-bar {
+            background: white;
+            padding: 10px 20px;
+            border-bottom: 1px solid #ddd;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            font-size: 13px;
+        }
+        .config-bar input {
+            padding: 6px 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+            width: 200px;
+        }
+        .config-bar button {
+            padding: 6px 14px;
+            background: #0066cc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .config-bar button:hover { background: #0052a3; }
+        .config-status { font-size: 12px; color: #666; }
+        .config-status.error { color: #cc0000; }
+        .config-status.success { color: #00aa00; }
+        .card {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .card h2 { font-size: 16px; margin-bottom: 15px; color: #333; }
+        .btn {
+            padding: 8px 16px;
+            background: #0066cc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 13px;
+        }
+        .btn:hover { background: #0052a3; }
+        .btn-secondary { background: #666; }
+        .btn-secondary:hover { background: #555; }
+        .btn-danger { background: #cc0000; }
+        .btn-danger:hover { background: #aa0000; }
+        .btn-success { background: #00aa00; }
+        .btn-success:hover { background: #008800; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 10px; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; font-weight: 600; }
+        tr:hover { background: #f8f9fa; }
+        .status-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .status-proposed { background: #fff3cd; color: #856404; }
+        .status-approved { background: #d4edda; color: #155724; }
+        .status-rejected { background: #f8d7da; color: #721c24; }
+        .status-executed { background: #cce5ff; color: #004085; }
+        .status-cancelled { background: #e2e3e5; color: #383d41; }
+        .status-todo { background: #e2e3e5; color: #383d41; }
+        .status-doing { background: #fff3cd; color: #856404; }
+        .status-done { background: #d4edda; color: #155724; }
+        .status-active { background: #d4edda; color: #155724; }
+        .status-superseded { background: #e2e3e5; color: #383d41; }
+        .priority-high { color: #cc0000; font-weight: 500; }
+        .priority-medium { color: #cc6600; }
+        .priority-low { color: #666; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; margin-bottom: 5px; font-size: 13px; font-weight: 500; }
+        .form-group input, .form-group select, .form-group textarea {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 13px;
+        }
+        .form-group textarea { min-height: 80px; resize: vertical; }
+        .form-row { display: flex; gap: 15px; }
+        .form-row .form-group { flex: 1; }
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal.active { display: flex; }
+        .modal-content {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            max-width: 600px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-header { display: flex; justify-content: space-between; margin-bottom: 15px; }
+        .modal-header h3 { font-size: 16px; }
+        .modal-close { cursor: pointer; font-size: 20px; color: #666; }
+        .detail-section { margin-bottom: 20px; }
+        .detail-section h4 { font-size: 13px; color: #666; margin-bottom: 8px; text-transform: uppercase; }
+        .detail-value { font-size: 14px; color: #333; white-space: pre-wrap; }
+        .search-box {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .search-box input { flex: 1; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .tabs { display: flex; border-bottom: 1px solid #ddd; margin-bottom: 15px; }
+        .tab { padding: 10px 20px; cursor: pointer; font-size: 14px; color: #666; border-bottom: 2px solid transparent; }
+        .tab:hover { color: #333; }
+        .tab.active { color: #0066cc; border-bottom-color: #0066cc; }
+        .empty-state { text-align: center; color: #999; padding: 40px; font-size: 14px; }
+        .action-buttons { display: flex; gap: 8px; }
+        pre { background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Core Business OS</h1>
+        <div class="header-links">
+            <a href="/ui">Chat</a>
+            <a href="#" id="console-link" style="display: none;">Console</a>
+        </div>
+    </div>
+    <div class="config-bar">
+        <input type="text" id="tenant-id" placeholder="Tenant ID">
+        <input type="text" id="api-key" placeholder="API Key">
+        <input type="text" id="user-id" placeholder="User ID">
+        <button onclick="saveConfig()">Connect</button>
+        <span class="config-status" id="config-status"></span>
+        <span style="margin-left: auto; font-size: 12px; color: #666;" id="user-role"></span>
+    </div>
+    <div class="main">
+        <div class="sidebar">
+            <a href="#" data-section="today" class="active">Today</a>
+            <hr>
+            <a href="#" data-section="actions">Actions</a>
+            <a href="#" data-section="tasks">Tasks</a>
+            <a href="#" data-section="decisions">Decisions</a>
+            <a href="#" data-section="meetings">Meetings</a>
+            <a href="#" data-section="memory">Memory</a>
+            <hr>
+            <a href="#" data-section="timeline">Timeline</a>
+            <a href="#" data-section="search">Search</a>
+        </div>
+        <div class="content" id="content">
+            <div class="empty-state">Configure credentials to connect</div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Modal -->
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">Create</h3>
+                <span class="modal-close" onclick="closeModal()">&times;</span>
+            </div>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentSection = 'today';
+        let userRole = 'member';
+
+        window.DEV_CONSOLE_ENABLED = {DEV_CONSOLE_ENABLED};
+        window.DEV_CONSOLE_KEY = '{DEV_CONSOLE_KEY}';
+
+        document.addEventListener('DOMContentLoaded', () => {
+            // Load saved config
+            ['tenant-id', 'api-key', 'user-id'].forEach(id => {
+                const val = localStorage.getItem('playground_' + id.replace('-', '_'));
+                if (val) document.getElementById(id).value = val;
+            });
+
+            // Console link
+            if (window.DEV_CONSOLE_ENABLED) {
+                const link = document.getElementById('console-link');
+                link.style.display = 'inline';
+                link.href = '/console?key=' + window.DEV_CONSOLE_KEY;
+            }
+
+            // Navigation
+            document.querySelectorAll('.sidebar a').forEach(a => {
+                a.addEventListener('click', e => {
+                    e.preventDefault();
+                    document.querySelectorAll('.sidebar a').forEach(el => el.classList.remove('active'));
+                    a.classList.add('active');
+                    currentSection = a.dataset.section;
+                    loadSection(currentSection);
+                });
+            });
+
+            if (document.getElementById('tenant-id').value) {
+                saveConfig();
+            }
+        });
+
+        function getHeaders() {
+            return {
+                'Content-Type': 'application/json',
+                'X-Tenant-ID': document.getElementById('tenant-id').value,
+                'X-API-Key': document.getElementById('api-key').value,
+                'X-User-ID': document.getElementById('user-id').value
+            };
+        }
+
+        function setStatus(msg, type) {
+            const el = document.getElementById('config-status');
+            el.textContent = msg;
+            el.className = 'config-status ' + (type || '');
+        }
+
+        async function saveConfig() {
+            ['tenant-id', 'api-key', 'user-id'].forEach(id => {
+                localStorage.setItem('playground_' + id.replace('-', '_'), document.getElementById(id).value);
+            });
+
+            // Test connection and get user role
+            try {
+                const res = await fetch('/v1/conversations', { headers: getHeaders() });
+                if (!res.ok) throw new Error('Auth failed');
+                setStatus('Connected', 'success');
+
+                // Try to determine role from a test call
+                const actionsRes = await fetch('/v1/actions?limit=1', { headers: getHeaders() });
+                userRole = actionsRes.ok ? 'admin' : 'member';
+                document.getElementById('user-role').textContent = 'Role: ' + userRole;
+
+                loadSection(currentSection);
+            } catch (e) {
+                setStatus('Connection failed', 'error');
+            }
+        }
+
+        function loadSection(section) {
+            const content = document.getElementById('content');
+            switch(section) {
+                case 'today': loadToday(); break;
+                case 'actions': loadActions(); break;
+                case 'tasks': loadTasks(); break;
+                case 'decisions': loadDecisions(); break;
+                case 'meetings': loadMeetings(); break;
+                case 'memory': loadMemory(); break;
+                case 'timeline': loadTimeline(); break;
+                case 'search': loadSearch(); break;
+            }
+        }
+
+        async function loadToday() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const [actionsRes, tasksRes] = await Promise.all([
+                    fetch('/v1/actions?status=proposed&limit=5', { headers: getHeaders() }),
+                    fetch('/v1/tasks?status=todo&limit=5', { headers: getHeaders() })
+                ]);
+
+                const actions = actionsRes.ok ? (await actionsRes.json()).items : [];
+                const tasks = tasksRes.ok ? (await tasksRes.json()).items : [];
+
+                content.innerHTML = `
+                    <div class="card">
+                        <h2>Open Actions (${actions.length})</h2>
+                        ${actions.length ? `<table>
+                            <tr><th>Title</th><th>Type</th><th>Status</th></tr>
+                            ${actions.map(a => `<tr>
+                                <td><a href="#" onclick="viewAction('${a.action_id}')">${escapeHtml(a.title)}</a></td>
+                                <td>${a.action_type}</td>
+                                <td><span class="status-badge status-${a.status}">${a.status}</span></td>
+                            </tr>`).join('')}
+                        </table>` : '<p style="color:#999">No open actions</p>'}
+                    </div>
+                    <div class="card">
+                        <h2>Tasks Due Soon (${tasks.length})</h2>
+                        ${tasks.length ? `<table>
+                            <tr><th>Title</th><th>Priority</th><th>Due</th></tr>
+                            ${tasks.map(t => `<tr>
+                                <td><a href="#" onclick="viewTask('${t.task_id}')">${escapeHtml(t.title)}</a></td>
+                                <td class="priority-${t.priority}">${t.priority}</td>
+                                <td>${t.due_date || '-'}</td>
+                            </tr>`).join('')}
+                        </table>` : '<p style="color:#999">No pending tasks</p>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading data</div>';
+            }
+        }
+
+        async function loadActions() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/actions?limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Actions (${data.total})</h2>
+                            <button class="btn" onclick="showCreateAction()">+ New Action</button>
+                        </div>
+                        ${data.items.length ? `<table>
+                            <tr><th>Title</th><th>Type</th><th>Source</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+                            ${data.items.map(a => `<tr>
+                                <td><a href="#" onclick="viewAction('${a.action_id}')">${escapeHtml(a.title)}</a></td>
+                                <td>${a.action_type}</td>
+                                <td>${a.source}</td>
+                                <td><span class="status-badge status-${a.status}">${a.status}</span></td>
+                                <td>${a.created_at.split('T')[0]}</td>
+                                <td class="action-buttons">
+                                    ${a.status === 'proposed' ? `
+                                        <button class="btn btn-success" onclick="approveAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Approve</button>
+                                        <button class="btn btn-danger" onclick="rejectAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Reject</button>
+                                    ` : ''}
+                                    ${a.status === 'approved' ? `
+                                        <button class="btn" onclick="executeAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Execute</button>
+                                    ` : ''}
+                                </td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No actions yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading actions</div>';
+            }
+        }
+
+        async function loadTasks() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/tasks?limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Tasks (${data.total})</h2>
+                            <button class="btn" onclick="showCreateTask()">+ New Task</button>
+                        </div>
+                        ${data.items.length ? `<table>
+                            <tr><th>Title</th><th>Status</th><th>Priority</th><th>Due</th><th>Actions</th></tr>
+                            ${data.items.map(t => `<tr>
+                                <td><a href="#" onclick="viewTask('${t.task_id}')">${escapeHtml(t.title)}</a></td>
+                                <td><span class="status-badge status-${t.status}">${t.status}</span></td>
+                                <td class="priority-${t.priority}">${t.priority}</td>
+                                <td>${t.due_date || '-'}</td>
+                                <td>
+                                    ${t.status !== 'done' ? `<button class="btn btn-success" onclick="completeTask('${t.task_id}')" style="padding:4px 8px;font-size:11px;">Complete</button>` : ''}
+                                </td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No tasks yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading tasks</div>';
+            }
+        }
+
+        async function loadDecisions() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/decisions?limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Decisions (${data.total})</h2>
+                            <button class="btn" onclick="showCreateDecision()">+ New Decision</button>
+                        </div>
+                        ${data.items.length ? `<table>
+                            <tr><th>Title</th><th>Date</th><th>Status</th></tr>
+                            ${data.items.map(d => `<tr>
+                                <td><a href="#" onclick="viewDecision('${d.decision_id}')">${escapeHtml(d.title)}</a></td>
+                                <td>${d.decision_date}</td>
+                                <td><span class="status-badge status-${d.status}">${d.status}</span></td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No decisions yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading decisions</div>';
+            }
+        }
+
+        async function loadMeetings() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/meetings?limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Meeting Notes (${data.total})</h2>
+                            <button class="btn" onclick="showCreateMeeting()">+ New Meeting Note</button>
+                        </div>
+                        ${data.items.length ? `<table>
+                            <tr><th>Title</th><th>Date</th></tr>
+                            ${data.items.map(m => `<tr>
+                                <td><a href="#" onclick="viewMeeting('${m.meeting_id}')">${escapeHtml(m.title)}</a></td>
+                                <td>${m.meeting_date}</td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No meeting notes yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading meetings</div>';
+            }
+        }
+
+        async function loadMemory() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/memory/facts?status=active&limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Memory Facts (${data.total})</h2>
+                            <button class="btn" onclick="showCreateFact()">+ New Fact</button>
+                        </div>
+                        ${data.items.length ? `<table>
+                            <tr><th>Key</th><th>Category</th><th>Value</th><th>Status</th></tr>
+                            ${data.items.map(f => `<tr>
+                                <td><a href="#" onclick="viewFact('${f.fact_id}')">${escapeHtml(f.fact_key)}</a></td>
+                                <td>${f.category}</td>
+                                <td>${escapeHtml(f.fact_value.substring(0, 50))}${f.fact_value.length > 50 ? '...' : ''}</td>
+                                <td><span class="status-badge status-${f.status}">${f.status}</span></td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No memory facts yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading memory</div>';
+            }
+        }
+
+        async function loadTimeline() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/timeline?limit=50', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <h2>Timeline (${data.total})</h2>
+                        ${data.items.length ? `<table>
+                            <tr><th>Event</th><th>Entity</th><th>Summary</th><th>Time</th></tr>
+                            ${data.items.map(e => `<tr>
+                                <td>${e.event_type}</td>
+                                <td>${e.entity_type}/${e.entity_id.substring(0, 8)}...</td>
+                                <td>${escapeHtml(e.summary)}</td>
+                                <td>${e.created_at.split('T')[0]}</td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No timeline events yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading timeline</div>';
+            }
+        }
+
+        async function loadSearch() {
+            const content = document.getElementById('content');
+            content.innerHTML = `
+                <div class="card">
+                    <h2>Global Search</h2>
+                    <div class="search-box">
+                        <input type="text" id="search-input" placeholder="Search across all entities..." onkeypress="if(event.key==='Enter')doSearch()">
+                        <button class="btn" onclick="doSearch()">Search</button>
+                    </div>
+                    <div id="search-results"></div>
+                </div>
+            `;
+        }
+
+        async function doSearch() {
+            const q = document.getElementById('search-input').value.trim();
+            if (!q) return;
+
+            const results = document.getElementById('search-results');
+            results.innerHTML = '<div class="empty-state">Searching...</div>';
+
+            try {
+                const res = await fetch('/v1/search?q=' + encodeURIComponent(q), { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                results.innerHTML = data.results.length ? `<table>
+                    <tr><th>Type</th><th>Title</th><th>Snippet</th></tr>
+                    ${data.results.map(r => `<tr>
+                        <td>${r.entity_type}</td>
+                        <td><a href="#" onclick="viewRecord('${r.entity_type}', '${r.entity_id}')">${escapeHtml(r.title)}</a></td>
+                        <td>${escapeHtml(r.snippet || '')}</td>
+                    </tr>`).join('')}
+                </table>` : '<div class="empty-state">No results found</div>';
+            } catch (e) {
+                results.innerHTML = '<div class="empty-state">Search failed</div>';
+            }
+        }
+
+        // Modal functions
+        function openModal(title, body) {
+            document.getElementById('modal-title').textContent = title;
+            document.getElementById('modal-body').innerHTML = body;
+            document.getElementById('modal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('modal').classList.remove('active');
+        }
+
+        // Create forms
+        function showCreateAction() {
+            openModal('Create Action', `
+                <div class="form-group"><label>Title</label><input type="text" id="action-title"></div>
+                <div class="form-group"><label>Description</label><textarea id="action-description"></textarea></div>
+                <div class="form-row">
+                    <div class="form-group"><label>Type</label><input type="text" id="action-type" value="general"></div>
+                    <div class="form-group"><label>Source</label><select id="action-source"><option>user</option><option>agent</option><option>system</option></select></div>
+                </div>
+                <button class="btn" onclick="createAction()">Create</button>
+            `);
+        }
+
+        async function createAction() {
+            const body = {
+                title: document.getElementById('action-title').value,
+                description: document.getElementById('action-description').value,
+                action_type: document.getElementById('action-type').value,
+                source: document.getElementById('action-source').value,
+                payload: {}
+            };
+            try {
+                const res = await fetch('/v1/actions', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                closeModal();
+                loadActions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        function showCreateTask() {
+            openModal('Create Task', `
+                <div class="form-group"><label>Title</label><input type="text" id="task-title"></div>
+                <div class="form-group"><label>Description</label><textarea id="task-description"></textarea></div>
+                <div class="form-row">
+                    <div class="form-group"><label>Priority</label><select id="task-priority"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option></select></div>
+                    <div class="form-group"><label>Due Date</label><input type="date" id="task-due"></div>
+                </div>
+                <button class="btn" onclick="createTask()">Create</button>
+            `);
+        }
+
+        async function createTask() {
+            const body = {
+                title: document.getElementById('task-title').value,
+                description: document.getElementById('task-description').value,
+                priority: document.getElementById('task-priority').value,
+                due_date: document.getElementById('task-due').value || null
+            };
+            try {
+                const res = await fetch('/v1/tasks', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                closeModal();
+                loadTasks();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        function showCreateDecision() {
+            openModal('Create Decision', `
+                <div class="form-group"><label>Title</label><input type="text" id="decision-title"></div>
+                <div class="form-group"><label>Date</label><input type="date" id="decision-date" value="${new Date().toISOString().split('T')[0]}"></div>
+                <div class="form-group"><label>Context</label><textarea id="decision-context"></textarea></div>
+                <div class="form-group"><label>Decision</label><textarea id="decision-text"></textarea></div>
+                <div class="form-group"><label>Rationale</label><textarea id="decision-rationale"></textarea></div>
+                <button class="btn" onclick="createDecision()">Create</button>
+            `);
+        }
+
+        async function createDecision() {
+            const body = {
+                title: document.getElementById('decision-title').value,
+                decision_date: document.getElementById('decision-date').value,
+                context: document.getElementById('decision-context').value,
+                decision: document.getElementById('decision-text').value,
+                rationale: document.getElementById('decision-rationale').value
+            };
+            try {
+                const res = await fetch('/v1/decisions', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                closeModal();
+                loadDecisions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        function showCreateMeeting() {
+            openModal('Create Meeting Note', `
+                <div class="form-group"><label>Title</label><input type="text" id="meeting-title"></div>
+                <div class="form-group"><label>Date</label><input type="date" id="meeting-date" value="${new Date().toISOString().split('T')[0]}"></div>
+                <div class="form-group"><label>Notes</label><textarea id="meeting-notes" style="min-height:150px;"></textarea></div>
+                <button class="btn" onclick="createMeeting()">Create</button>
+            `);
+        }
+
+        async function createMeeting() {
+            const body = {
+                title: document.getElementById('meeting-title').value,
+                meeting_date: document.getElementById('meeting-date').value,
+                notes: document.getElementById('meeting-notes').value
+            };
+            try {
+                const res = await fetch('/v1/meetings', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                closeModal();
+                loadMeetings();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        function showCreateFact() {
+            openModal('Create Memory Fact', `
+                <div class="form-row">
+                    <div class="form-group"><label>Category</label><select id="fact-category">
+                        <option value="icp">ICP</option><option value="positioning">Positioning</option><option value="pricing">Pricing</option>
+                        <option value="goals">Goals</option><option value="constraints">Constraints</option><option value="brand">Brand</option><option value="other">Other</option>
+                    </select></div>
+                    <div class="form-group"><label>Key</label><input type="text" id="fact-key" placeholder="e.g. ICP.primary"></div>
+                </div>
+                <div class="form-group"><label>Value</label><textarea id="fact-value" style="min-height:100px;"></textarea></div>
+                <button class="btn" onclick="createFact()">Create</button>
+            `);
+        }
+
+        async function createFact() {
+            const body = {
+                category: document.getElementById('fact-category').value,
+                fact_key: document.getElementById('fact-key').value,
+                fact_value: document.getElementById('fact-value').value
+            };
+            try {
+                const res = await fetch('/v1/memory/facts', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                closeModal();
+                loadMemory();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        // Action operations
+        async function approveAction(id) {
+            if (!confirm('Approve this action?')) return;
+            try {
+                const res = await fetch('/v1/actions/' + id + '/approve', { method: 'POST', headers: getHeaders(), body: '{}' });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                loadActions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function rejectAction(id) {
+            if (!confirm('Reject this action?')) return;
+            try {
+                const res = await fetch('/v1/actions/' + id + '/reject', { method: 'POST', headers: getHeaders(), body: '{}' });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                loadActions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function executeAction(id) {
+            if (!confirm('Execute this action?')) return;
+            try {
+                const res = await fetch('/v1/actions/' + id + '/execute', {
+                    method: 'POST', headers: getHeaders(),
+                    body: JSON.stringify({ execution_status: 'succeeded', result: {} })
+                });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                loadActions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function completeTask(id) {
+            try {
+                const res = await fetch('/v1/tasks/' + id + '/complete', { method: 'POST', headers: getHeaders() });
+                if (!res.ok) throw new Error((await res.json()).detail);
+                loadTasks();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        // View record details
+        async function viewRecord(type, id) {
+            try {
+                const res = await fetch('/v1/records/' + type + '/' + id, { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                let body = `<div class="detail-section"><h4>Entity</h4><pre>${JSON.stringify(data.entity, null, 2)}</pre></div>`;
+                if (data.evidence.length) {
+                    body += `<div class="detail-section"><h4>Evidence (${data.evidence.length})</h4><pre>${JSON.stringify(data.evidence, null, 2)}</pre></div>`;
+                }
+                if (data.timeline.length) {
+                    body += `<div class="detail-section"><h4>Timeline (${data.timeline.length})</h4><pre>${JSON.stringify(data.timeline, null, 2)}</pre></div>`;
+                }
+
+                openModal(type.charAt(0).toUpperCase() + type.slice(1) + ' Details', body);
+            } catch (e) { alert('Error loading record'); }
+        }
+
+        function viewAction(id) { viewRecord('action', id); }
+        function viewTask(id) { viewRecord('task', id); }
+        function viewDecision(id) { viewRecord('decision', id); }
+        function viewMeeting(id) { viewRecord('meeting', id); }
+        function viewFact(id) { viewRecord('memory_fact', id); }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@router.get("/app", response_class=HTMLResponse)
+def core_os_ui() -> str:
+    """Serve the Core Business OS UI.
+
+    Enabled via PLAYGROUND_UI_ENABLED=1 environment variable.
+    """
+    if not PLAYGROUND_UI_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Core OS UI is disabled. Set PLAYGROUND_UI_ENABLED=1 to enable.",
+        )
+
+    html = CORE_OS_HTML.replace(
+        "{DEV_CONSOLE_ENABLED}",
+        "true" if DEV_CONSOLE_ENABLED else "false"
+    ).replace(
+        "{DEV_CONSOLE_KEY}",
+        DEV_CONSOLE_KEY if DEV_CONSOLE_ENABLED else ""
+    )
+
+    return html

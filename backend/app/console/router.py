@@ -30,6 +30,16 @@ from app.gateway.models import (
     Capability,
     TenantSubscription,
     UsageRollupPeriod,
+    # Core Business OS models
+    Action,
+    ActionReview,
+    ActionExecution,
+    Task,
+    MeetingNote,
+    Decision,
+    MemoryFact,
+    EvidenceLink,
+    TimelineEvent,
 )
 
 router = APIRouter(prefix="/console", tags=["console"])
@@ -60,6 +70,16 @@ ALLOWED_TABLES = {
     "capabilities": Capability,
     "tenant_subscriptions": TenantSubscription,
     "usage_rollups_period": UsageRollupPeriod,
+    # Core Business OS tables
+    "actions": Action,
+    "action_reviews": ActionReview,
+    "action_executions": ActionExecution,
+    "tasks": Task,
+    "meeting_notes": MeetingNote,
+    "decisions": Decision,
+    "memory_facts": MemoryFact,
+    "evidence_links": EvidenceLink,
+    "timeline_events": TimelineEvent,
 }
 
 
@@ -112,6 +132,7 @@ def html_page(title: str, content: str) -> str:
         <a href="/console?key={DEV_CONSOLE_KEY}">Overview</a>
         <a href="/console/tenants?key={DEV_CONSOLE_KEY}">Tenants</a>
         <a href="/console/billing?key={DEV_CONSOLE_KEY}">Billing</a>
+        <a href="/console/core-os?key={DEV_CONSOLE_KEY}">Core OS</a>
         <a href="/console/db/tenants?key={DEV_CONSOLE_KEY}">Tables</a>
         <a href="/console/db/download?key={DEV_CONSOLE_KEY}">Download DB</a>
     </div>
@@ -153,6 +174,14 @@ def console_overview(
         "Metered Events": db.query(func.count(MeteredEventType.event_key)).scalar() or 0,
         "Plans": db.query(func.count(Plan.plan_id)).scalar() or 0,
         "Subscriptions": db.query(func.count(TenantSubscription.tenant_id)).scalar() or 0,
+        # Core Business OS counts
+        "Actions": db.query(func.count(Action.action_id)).scalar() or 0,
+        "Tasks": db.query(func.count(Task.task_id)).scalar() or 0,
+        "Decisions": db.query(func.count(Decision.decision_id)).scalar() or 0,
+        "Meeting Notes": db.query(func.count(MeetingNote.meeting_id)).scalar() or 0,
+        "Memory Facts": db.query(func.count(MemoryFact.fact_id)).scalar() or 0,
+        "Evidence Links": db.query(func.count(EvidenceLink.evidence_id)).scalar() or 0,
+        "Timeline Events": db.query(func.count(TimelineEvent.event_id)).scalar() or 0,
     }
 
     stats_html = ""
@@ -508,6 +537,115 @@ def console_table_viewer(
     """
 
     return html_page(f"Table: {table}", content)
+
+
+@router.get("/core-os", response_class=HTMLResponse)
+def console_core_os(
+    _: bool = Depends(verify_console_access),
+    db: Session = Depends(get_db),
+) -> str:
+    """Core Business OS overview: actions, tasks, decisions, memory, timeline."""
+    # Actions
+    actions = db.query(Action).order_by(Action.created_at.desc()).limit(20).all()
+    actions_html = """<table>
+        <tr><th>Action ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Type</th><th>Created At</th></tr>"""
+    for a in actions:
+        actions_html += f"""<tr>
+            <td>{a.action_id[:8]}...</td>
+            <td><a href="/console/tenants/{a.tenant_id}?key={DEV_CONSOLE_KEY}">{a.tenant_id[:8]}...</a></td>
+            <td>{a.title[:50]}...</td>
+            <td>{a.status}</td>
+            <td>{a.action_type}</td>
+            <td>{a.created_at}</td>
+        </tr>"""
+    actions_html += "</table>"
+
+    # Tasks
+    tasks = db.query(Task).order_by(Task.created_at.desc()).limit(20).all()
+    tasks_html = """<table>
+        <tr><th>Task ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Priority</th><th>Due Date</th></tr>"""
+    for t in tasks:
+        tasks_html += f"""<tr>
+            <td>{t.task_id[:8]}...</td>
+            <td>{t.tenant_id[:8]}...</td>
+            <td>{t.title[:50]}...</td>
+            <td>{t.status}</td>
+            <td>{t.priority}</td>
+            <td>{t.due_date or '-'}</td>
+        </tr>"""
+    tasks_html += "</table>"
+
+    # Decisions
+    decisions = db.query(Decision).order_by(Decision.created_at.desc()).limit(20).all()
+    decisions_html = """<table>
+        <tr><th>Decision ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Date</th></tr>"""
+    for d in decisions:
+        decisions_html += f"""<tr>
+            <td>{d.decision_id[:8]}...</td>
+            <td>{d.tenant_id[:8]}...</td>
+            <td>{d.title[:50]}...</td>
+            <td>{d.status}</td>
+            <td>{d.decision_date}</td>
+        </tr>"""
+    decisions_html += "</table>"
+
+    # Memory Facts
+    facts = db.query(MemoryFact).order_by(MemoryFact.created_at.desc()).limit(20).all()
+    facts_html = """<table>
+        <tr><th>Fact ID</th><th>Tenant</th><th>Category</th><th>Key</th><th>Status</th></tr>"""
+    for f in facts:
+        facts_html += f"""<tr>
+            <td>{f.fact_id[:8]}...</td>
+            <td>{f.tenant_id[:8]}...</td>
+            <td>{f.category}</td>
+            <td>{f.fact_key[:30]}...</td>
+            <td>{f.status}</td>
+        </tr>"""
+    facts_html += "</table>"
+
+    # Timeline Events
+    timeline = db.query(TimelineEvent).order_by(TimelineEvent.created_at.desc()).limit(30).all()
+    timeline_html = """<table>
+        <tr><th>Event ID</th><th>Tenant</th><th>Event Type</th><th>Entity</th><th>Summary</th><th>Created At</th></tr>"""
+    for e in timeline:
+        timeline_html += f"""<tr>
+            <td>{e.event_id[:8]}...</td>
+            <td>{e.tenant_id[:8]}...</td>
+            <td>{e.event_type}</td>
+            <td>{e.entity_type}/{e.entity_id[:8]}...</td>
+            <td>{e.summary[:40]}...</td>
+            <td>{e.created_at}</td>
+        </tr>"""
+    timeline_html += "</table>"
+
+    content = f"""
+    <div class="card">
+        <h2>Recent Actions ({len(actions)})</h2>
+        {actions_html}
+    </div>
+
+    <div class="card">
+        <h2>Recent Tasks ({len(tasks)})</h2>
+        {tasks_html}
+    </div>
+
+    <div class="card">
+        <h2>Recent Decisions ({len(decisions)})</h2>
+        {decisions_html}
+    </div>
+
+    <div class="card">
+        <h2>Memory Facts ({len(facts)})</h2>
+        {facts_html}
+    </div>
+
+    <div class="card">
+        <h2>Timeline (Recent 30)</h2>
+        {timeline_html}
+    </div>
+    """
+
+    return html_page("Core Business OS", content)
 
 
 @router.get("/db/download")
