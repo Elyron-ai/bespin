@@ -176,6 +176,15 @@ def get_period_usage_summary(
         UsageRollupPeriod.period_start == period_start,
     ).all()
 
+    # Batch fetch all event types to avoid N+1 query
+    event_keys = [r.event_key for r in rollups]
+    event_types = {}
+    if event_keys:
+        event_type_rows = db.query(MeteredEventType).filter(
+            MeteredEventType.event_key.in_(event_keys)
+        ).all()
+        event_types = {et.event_key: et for et in event_type_rows}
+
     total_credits = 0.0
     total_list_cost_estimate = 0.0
     breakdown = []
@@ -184,10 +193,8 @@ def get_period_usage_summary(
         total_credits += rollup.credits
         total_list_cost_estimate += rollup.list_cost_estimate
 
-        # Get display info from event type
-        event_type = db.query(MeteredEventType).filter(
-            MeteredEventType.event_key == rollup.event_key
-        ).first()
+        # Get display info from pre-fetched event types
+        event_type = event_types.get(rollup.event_key)
 
         breakdown.append({
             "event_key": rollup.event_key,

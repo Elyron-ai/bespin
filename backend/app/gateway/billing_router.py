@@ -1,5 +1,6 @@
 """Billing API router for managing metered events, plans, and usage."""
 import os
+import secrets
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -76,7 +77,8 @@ def verify_platform_admin(
             detail="Not Found",
         )
 
-    if x_platform_admin_key != admin_key:
+    # Use constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(x_platform_admin_key or "", admin_key):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Not Found",
@@ -86,9 +88,6 @@ def verify_platform_admin(
 # =============================================================================
 # Tenant Authentication (reused from main router)
 # =============================================================================
-
-import secrets
-
 
 def get_tenant_context_for_billing(
     x_tenant_id: Annotated[str | None, Header()] = None,

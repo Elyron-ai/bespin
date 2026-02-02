@@ -83,6 +83,11 @@ def store_idempotency(
         idempotency_key: The idempotency key from the request header.
         request_body: The request body for hash computation.
         response: The response to store.
+
+    Note:
+        This function does NOT commit the transaction. The caller is responsible
+        for committing to ensure the idempotency record is stored atomically
+        with the main operation.
     """
     record = IdempotencyKey(
         tenant_id=tenant_id,
@@ -92,4 +97,4 @@ def store_idempotency(
         response_json=json.dumps(response),
     )
     db.add(record)
-    db.commit()
+    db.flush()  # Flush to detect constraint violations early, but don't commit

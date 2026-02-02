@@ -1,5 +1,6 @@
 """Dev Console for viewing database state."""
 import os
+import secrets
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -66,9 +67,17 @@ def verify_console_access(key: str = Query(...)):
     """Verify console access is enabled and key is valid."""
     if not DEV_CONSOLE_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    if key != DEV_CONSOLE_KEY:
+    # Use constant-time comparison to prevent timing attacks
+    if not secrets.compare_digest(key, DEV_CONSOLE_KEY):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return True
+
+
+def mask_api_key(api_key: str) -> str:
+    """Mask an API key, showing only first 4 and last 4 characters."""
+    if len(api_key) <= 12:
+        return "*" * len(api_key)
+    return f"{api_key[:4]}{'*' * (len(api_key) - 8)}{api_key[-4:]}"
 
 
 def html_page(title: str, content: str) -> str:
@@ -186,7 +195,7 @@ def console_tenants(
             <td><a href="/console/tenants/{t.tenant_id}?key={DEV_CONSOLE_KEY}">{t.tenant_id}</a></td>
             <td>{t.name}</td>
             <td>{t.region}</td>
-            <td class="truncate">{t.api_key}</td>
+            <td class="truncate">{mask_api_key(t.api_key)}</td>
             <td>{t.created_at}</td>
         </tr>
         """
@@ -290,7 +299,7 @@ def console_tenant_detail(
         <p><strong>ID:</strong> {tenant.tenant_id}</p>
         <p><strong>Name:</strong> {tenant.name}</p>
         <p><strong>Region:</strong> {tenant.region}</p>
-        <p><strong>API Key:</strong> <code>{tenant.api_key}</code></p>
+        <p><strong>API Key:</strong> <code>{mask_api_key(tenant.api_key)}</code></p>
         <p><strong>Created:</strong> {tenant.created_at}</p>
     </div>
 

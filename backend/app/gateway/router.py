@@ -416,7 +416,7 @@ def invoke_tool(
     # Build response
     response = ToolInvokeResponse(request_id=request_id, result=result)
 
-    # Store idempotency record
+    # Store idempotency record and commit all changes atomically
     store_idempotency(
         db=db,
         tenant_id=context.tenant_id,
@@ -425,6 +425,7 @@ def invoke_tool(
         request_body=request_body,
         response=response.model_dump(),
     )
+    db.commit()
 
     return response
 
@@ -728,6 +729,7 @@ def materialize_brief(
             request_body=request_body,
             response=response.model_dump(),
         )
+        db.commit()
         return response
 
     # Brief will be newly created - check billing quota
@@ -795,7 +797,7 @@ def materialize_brief(
         content=content,
     )
 
-    # Store idempotency record
+    # Store idempotency record and commit all changes atomically
     store_idempotency(
         db=db,
         tenant_id=context.tenant_id,
@@ -804,6 +806,7 @@ def materialize_brief(
         request_body=request_body,
         response=response.model_dump(),
     )
+    db.commit()
 
     return response
 
@@ -1275,7 +1278,7 @@ def run_daily_brief_job(
         notifications_suppressed_due_to_quota=notifications_suppressed_due_to_quota,
     )
 
-    # Store idempotency record
+    # Store idempotency record and commit all changes atomically
     store_idempotency(
         db=db,
         tenant_id=context.tenant_id,
@@ -1284,6 +1287,7 @@ def run_daily_brief_job(
         request_body=request_body,
         response=response.model_dump(),
     )
+    db.commit()
 
     return response
 
