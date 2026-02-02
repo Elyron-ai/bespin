@@ -51,8 +51,10 @@ class UsageEvent(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String(36), nullable=False, index=True)
     user_id = Column(String(36), nullable=False)
-    activity_type = Column(String(100), nullable=False)
-    units = Column(Integer, nullable=False, default=1)
+    activity_type = Column(String(100), nullable=False)  # event_key
+    units = Column(Float, nullable=False, default=1)  # raw_units
+    credits = Column(Float, nullable=True, default=0.0)  # calculated credits
+    list_cost_estimate = Column(Float, nullable=True, default=0.0)  # calculated cost
     tool_name = Column(String(100), nullable=True)
     request_id = Column(String(36), nullable=False, index=True)
     created_at = Column(DateTime, default=utc_now, nullable=False)
@@ -225,4 +227,92 @@ class UsageRollupDaily(Base):
 
     __table_args__ = (
         Index("ix_usage_rollups_tenant_date", "tenant_id", "rollup_date"),
+    )
+
+
+# =============================================================================
+# Billing / Metering Models (Phase 0 Item #7)
+# =============================================================================
+
+class MeteredEventType(Base):
+    """Catalog of metered event types with weights and pricing."""
+    __tablename__ = "metered_event_types"
+
+    event_key = Column(String(100), primary_key=True)
+    display_name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    unit_name = Column(String(50), nullable=False)  # e.g. "call", "row", "brief"
+    credits_per_unit = Column(Float, nullable=False)  # weight
+    list_price_per_credit = Column(Float, nullable=False)  # catalog sticker price
+    billable = Column(Integer, nullable=False, default=1)  # 0 or 1
+    active = Column(Integer, nullable=False, default=1)  # 0 or 1
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+
+class Plan(Base):
+    """Billing plan with included credits and overage pricing."""
+    __tablename__ = "plans"
+
+    plan_id = Column(String(100), primary_key=True)
+    name = Column(String(255), nullable=False)
+    included_credits = Column(Integer, nullable=False)  # monthly included
+    overage_price_per_credit = Column(Float, nullable=False)
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+
+class PlanEventCap(Base):
+    """Per-event raw unit caps for a plan (optional)."""
+    __tablename__ = "plan_event_caps"
+
+    plan_id = Column(String(100), nullable=False, primary_key=True)
+    event_key = Column(String(100), nullable=False, primary_key=True)
+    period = Column(String(20), nullable=False, primary_key=True)  # "monthly" for v1
+    cap_raw_units = Column(Float, nullable=False)
+
+
+class Capability(Base):
+    """Feature capability that can be granted to plans."""
+    __tablename__ = "capabilities"
+
+    capability_key = Column(String(100), primary_key=True)
+    description = Column(Text, nullable=True)
+
+
+class PlanCapability(Base):
+    """Mapping of capabilities to plans (entitlements)."""
+    __tablename__ = "plan_capabilities"
+
+    plan_id = Column(String(100), nullable=False, primary_key=True)
+    capability_key = Column(String(100), nullable=False, primary_key=True)
+
+
+class TenantSubscription(Base):
+    """Tenant subscription to a plan with billing period."""
+    __tablename__ = "tenant_subscriptions"
+
+    tenant_id = Column(String(36), primary_key=True)
+    plan_id = Column(String(100), nullable=False)
+    status = Column(String(20), nullable=False)  # "active" | "suspended"
+    period_start = Column(String(10), nullable=False)  # YYYY-MM-01
+    period_end = Column(String(10), nullable=False)  # next YYYY-MM-01
+    created_at = Column(String(30), nullable=False)  # ISO 8601
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+
+class UsageRollupPeriod(Base):
+    """Monthly usage rollup with credits and cost estimates."""
+    __tablename__ = "usage_rollups_period"
+
+    tenant_id = Column(String(36), nullable=False, primary_key=True)
+    period_start = Column(String(10), nullable=False, primary_key=True)  # YYYY-MM-01
+    event_key = Column(String(100), nullable=False, primary_key=True)
+    raw_units = Column(Float, nullable=False, default=0.0)
+    credits = Column(Float, nullable=False, default=0.0)
+    list_cost_estimate = Column(Float, nullable=False, default=0.0)
+    updated_at = Column(String(30), nullable=False)  # ISO 8601
+
+    __table_args__ = (
+        Index("ix_usage_rollups_period_tenant", "tenant_id", "period_start"),
     )
