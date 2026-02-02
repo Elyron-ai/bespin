@@ -508,7 +508,7 @@ def list_actions(
     """List actions for the tenant.
 
     Args:
-        status: Filter by status (proposed, cancelled, or all). Default: proposed.
+        status: Filter by status (proposed, approved, rejected, cancelled, executed, or all). Default: proposed.
         created_by_user_id: Filter by creator.
         assigned_to_user_id: Filter by assignee.
         limit: Max results (1-200). Default: 50.
@@ -765,7 +765,13 @@ def approve_action(
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
 ) -> ActionResponse:
-    """Approve an action (admin only)."""
+    """Approve an action (admin only).
+
+    Idempotent: If already approved, returns 200 without emitting usage/audit/timeline.
+    Returns 409 Conflict if:
+    - Action is cancelled (cannot approve cancelled action)
+    - Action is already rejected (cannot change decision)
+    """
     request_id = str(uuid.uuid4())
     check_entitlement(db, context.tenant_id, "action_center")
     require_admin(context)
@@ -778,8 +784,44 @@ def approve_action(
     if not action:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
 
+    # Idempotent: if already approved, return without new writes
+    if action.status == "approved":
+        return ActionResponse(
+            action_id=action.action_id,
+            tenant_id=action.tenant_id,
+            created_by_user_id=action.created_by_user_id,
+            assigned_to_user_id=action.assigned_to_user_id,
+            source=action.source,
+            source_ref=action.source_ref,
+            status=action.status,
+            title=action.title,
+            description=action.description,
+            action_type=action.action_type,
+            payload=json.loads(action.payload_json),
+            created_at=action.created_at,
+            updated_at=action.updated_at,
+        )
+
+    # 409 Conflict for cancelled actions
+    if action.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot approve a cancelled action"
+        )
+
+    # 409 Conflict for rejected actions (cannot change decision)
+    if action.status == "rejected":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot approve an already rejected action"
+        )
+
+    # Can only approve proposed actions
     if action.status != "proposed":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only approve proposed actions")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot approve action with status '{action.status}'"
+        )
 
     check_billing_quota(db, context.tenant_id, "action_approved", 1)
 
@@ -803,7 +845,7 @@ def approve_action(
         db, context.tenant_id, context.user_id,
         "action_approved", "action", action_id,
         f"Action approved: {action.title}",
-        {"reviewer": context.user_id, "comment": approve_data.comment}
+        {"action_id": action_id, "decision": "approved", "comment": approve_data.comment, "reviewer_user_id": context.user_id}
     )
 
     log_audit(db, context.tenant_id, context.user_id, "actions.approve", "action_center", request_id)
@@ -836,7 +878,13 @@ def reject_action(
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
 ) -> ActionResponse:
-    """Reject an action (admin only)."""
+    """Reject an action (admin only).
+
+    Idempotent: If already rejected, returns 200 without emitting usage/audit/timeline.
+    Returns 409 Conflict if:
+    - Action is cancelled (cannot reject cancelled action)
+    - Action is already approved (cannot change decision)
+    """
     request_id = str(uuid.uuid4())
     check_entitlement(db, context.tenant_id, "action_center")
     require_admin(context)
@@ -849,8 +897,44 @@ def reject_action(
     if not action:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
 
+    # Idempotent: if already rejected, return without new writes
+    if action.status == "rejected":
+        return ActionResponse(
+            action_id=action.action_id,
+            tenant_id=action.tenant_id,
+            created_by_user_id=action.created_by_user_id,
+            assigned_to_user_id=action.assigned_to_user_id,
+            source=action.source,
+            source_ref=action.source_ref,
+            status=action.status,
+            title=action.title,
+            description=action.description,
+            action_type=action.action_type,
+            payload=json.loads(action.payload_json),
+            created_at=action.created_at,
+            updated_at=action.updated_at,
+        )
+
+    # 409 Conflict for cancelled actions
+    if action.status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot reject a cancelled action"
+        )
+
+    # 409 Conflict for approved actions (cannot change decision)
+    if action.status == "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot reject an already approved action"
+        )
+
+    # Can only reject proposed actions
     if action.status != "proposed":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only reject proposed actions")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot reject action with status '{action.status}'"
+        )
 
     check_billing_quota(db, context.tenant_id, "action_rejected", 1)
 
@@ -873,7 +957,7 @@ def reject_action(
         db, context.tenant_id, context.user_id,
         "action_rejected", "action", action_id,
         f"Action rejected: {action.title}",
-        {"reviewer": context.user_id, "comment": reject_data.comment}
+        {"action_id": action_id, "decision": "rejected", "comment": reject_data.comment, "reviewer_user_id": context.user_id}
     )
 
     log_audit(db, context.tenant_id, context.user_id, "actions.reject", "action_center", request_id)
@@ -1849,7 +1933,7 @@ def list_timeline_events(
     db: Session = Depends(get_db),
     entity_type: str | None = None,
     entity_id: str | None = None,
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> TimelineListResponse:
     """List timeline events for the tenant."""

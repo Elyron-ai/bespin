@@ -91,6 +91,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_phase0_item7.sh              # Billing + Metering smoke test
 ./scripts/smoke_core_os_v0.sh                # Core Business OS smoke test
 ./scripts/smoke_phase1_task8a_actions_v0.sh  # Actions v0 smoke test
+./scripts/smoke_phase1_task8b_action_approvals.sh  # Action Approvals smoke test
 ```
 
 ## API Overview
@@ -572,18 +573,71 @@ The Actions v0 smoke test demonstrates:
 5. Verifying action status changed to cancelled
 6. Fetching billing usage to see action_created and action_updated events
 
+### Running the Action Approvals Smoke Test (Phase 1 Task 8b)
+
+```bash
+# Server must be running
+./scripts/smoke_phase1_task8b_action_approvals.sh
+```
+
+The Action Approvals smoke test demonstrates:
+1. Creating a tenant with admin and member users
+2. Member creates 2 proposed actions
+3. Admin approves first action with comment
+4. Admin rejects second action with comment
+5. Listing actions by status (all, approved, rejected)
+6. Fetching timeline showing approval/rejection events
+7. Verifying billing usage for action_approved/action_rejected
+8. Testing idempotent retry (already approved -> 200)
+9. Testing conflict transitions (approve then reject -> 409)
+10. Testing RBAC (member cannot approve -> 403)
+
+### Action Status Values
+
+Actions can have the following statuses:
+- `proposed` - Initial state when action is created
+- `approved` - Admin approved the action
+- `rejected` - Admin rejected the action
+- `cancelled` - Creator or admin cancelled the action
+- `executed` - Action has been executed (Phase 1 Task 8c)
+
+### Action Review Log (v0)
+
+- Each action can have at most **one review** (approval or rejection)
+- Once approved or rejected, the decision cannot be changed (returns 409 Conflict)
+- Cancelled actions cannot be approved or rejected (returns 409 Conflict)
+- Review records are stored in the `action_reviews` table with:
+  - `reviewer_user_id`: The admin who made the decision
+  - `decision`: "approved" or "rejected"
+  - `comment`: Optional reviewer comment
+  - `created_at`: Timestamp of the review
+
+### Idempotent Approve/Reject Behavior
+
+- **Approving an already approved action**: Returns 200 with current action state, no additional writes
+- **Rejecting an already rejected action**: Returns 200 with current action state, no additional writes
+- **Changing a decision** (approve then reject, or vice versa): Returns 409 Conflict
+
 ### Actions v0 Metered Events
 
 | Event Key | Unit | Credits/Unit | Description |
 |-----------|------|--------------|-------------|
 | `action_created` | record | 0.2 | Action created (any status) |
 | `action_updated` | record | 0.1 | Action updated (including cancel) |
+| `action_approved` | event | 0.2 | Action approved by admin |
+| `action_rejected` | event | 0.1 | Action rejected by admin |
 
 ### Actions v0 Cancel RBAC Rules
 
 - **Member**: Can cancel their own proposed actions only
 - **Admin**: Can cancel any proposed action in the tenant
 - **Idempotent**: Cancelling an already cancelled action returns 200 without emitting usage/audit
+- **Cross-tenant**: Accessing another tenant's action returns 404 (not 403)
+
+### Actions Approve/Reject RBAC Rules
+
+- **Admin only**: Only admins can approve or reject actions
+- **Member**: Cannot approve or reject (returns 403)
 - **Cross-tenant**: Accessing another tenant's action returns 404 (not 403)
 
 ### Example: Action Workflow

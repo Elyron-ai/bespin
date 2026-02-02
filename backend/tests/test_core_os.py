@@ -1282,3 +1282,553 @@ class TestActionsV0CancelIdempotency:
             {"raw_units": 0}
         )
         assert updated_after_second["raw_units"] == updated_after_first["raw_units"]
+
+
+# =============================================================================
+# Actions Approvals v0 Tests (Phase 1, Task 8b)
+# =============================================================================
+
+class TestActionsApprovalsV0AdminApprove:
+    """Test admin approve flow (Phase 1 Task 8b)."""
+
+    def test_admin_approve_flow(self, client, admin_a_headers, member_a_headers):
+        """Admin can approve a proposed action created by member."""
+        # Member creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Member's Proposal", "action_type": "general", "payload": {}},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        action_id = response.json()["action_id"]
+        assert response.json()["status"] == "proposed"
+
+        # Admin approves
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={"comment": "Looks good!"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "approved"
+
+        # Verify action_reviews has exactly 1 row for this action with decision "approved"
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionReview
+        reviews = db.query(ActionReview).filter(
+            ActionReview.action_id == action_id
+        ).all()
+        assert len(reviews) == 1
+        assert reviews[0].decision == "approved"
+        assert reviews[0].comment == "Looks good!"
+        db.close()
+
+        # Verify timeline has exactly 1 action_approved event
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        events = response.json()["items"]
+        approved_events = [e for e in events if e["event_type"] == "action_approved"]
+        assert len(approved_events) == 1
+        assert "approved" in approved_events[0]["metadata"]["decision"]
+
+        # Verify billing usage includes action_approved
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        action_approved = next((b for b in breakdown if b["event_key"] == "action_approved"), None)
+        assert action_approved is not None
+        assert action_approved["raw_units"] >= 1
+
+
+class TestActionsApprovalsV0AdminReject:
+    """Test admin reject flow (Phase 1 Task 8b)."""
+
+    def test_admin_reject_flow(self, client, admin_a_headers, member_a_headers):
+        """Admin can reject a proposed action."""
+        # Member creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Questionable Proposal", "action_type": "general", "payload": {}},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        action_id = response.json()["action_id"]
+
+        # Admin rejects
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={"comment": "Not aligned with goals"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "rejected"
+
+        # Verify action_reviews has exactly 1 row with decision "rejected"
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionReview
+        reviews = db.query(ActionReview).filter(
+            ActionReview.action_id == action_id
+        ).all()
+        assert len(reviews) == 1
+        assert reviews[0].decision == "rejected"
+        assert reviews[0].comment == "Not aligned with goals"
+        db.close()
+
+        # Verify timeline has action_rejected event
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        events = response.json()["items"]
+        rejected_events = [e for e in events if e["event_type"] == "action_rejected"]
+        assert len(rejected_events) == 1
+
+        # Verify billing usage includes action_rejected
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        action_rejected = next((b for b in breakdown if b["event_key"] == "action_rejected"), None)
+        assert action_rejected is not None
+        assert action_rejected["raw_units"] >= 1
+
+
+class TestActionsApprovalsV0RBAC:
+    """Test RBAC rules for approve/reject (Phase 1 Task 8b)."""
+
+    def test_member_cannot_approve(self, client, admin_a_headers, member_a_headers):
+        """Member should not be able to approve an action."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Test", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Member tries to approve
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 403
+
+    def test_member_cannot_reject(self, client, admin_a_headers, member_a_headers):
+        """Member should not be able to reject an action."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Test", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Member tries to reject
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 403
+
+
+class TestActionsApprovalsV0TenantIsolation:
+    """Test tenant isolation for approve/reject (Phase 1 Task 8b)."""
+
+    def test_cross_tenant_approve_returns_404(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B admin cannot approve Tenant A's action (returns 404)."""
+        # Create action in tenant A
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Secret", "action_type": "confidential"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Tenant B admin tries to approve
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={},
+            headers=admin_b_headers,
+        )
+        assert response.status_code == 404
+
+    def test_cross_tenant_reject_returns_404(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B admin cannot reject Tenant A's action (returns 404)."""
+        # Create action in tenant A
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Secret", "action_type": "confidential"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Tenant B admin tries to reject
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={},
+            headers=admin_b_headers,
+        )
+        assert response.status_code == 404
+
+
+class TestActionsApprovalsV0Idempotency:
+    """Test idempotent retry behavior (Phase 1 Task 8b)."""
+
+    def test_approve_idempotent(self, client, admin_a_headers):
+        """Approving an already approved action returns 200 without additional writes."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Idempotent Test", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # First approve
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={"comment": "First approval"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "approved"
+
+        # Get usage after first approve
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        approved_after_first = next(
+            (b for b in breakdown if b["event_key"] == "action_approved"),
+            {"raw_units": 0}
+        )
+
+        # Get review count after first approve
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionReview
+        reviews_count_1 = db.query(ActionReview).filter(ActionReview.action_id == action_id).count()
+        db.close()
+
+        # Second approve (idempotent)
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={"comment": "Second approval attempt"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "approved"
+
+        # Usage should NOT have incremented
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        approved_after_second = next(
+            (b for b in breakdown if b["event_key"] == "action_approved"),
+            {"raw_units": 0}
+        )
+        assert approved_after_second["raw_units"] == approved_after_first["raw_units"]
+
+        # Review count should NOT have incremented
+        db = TestingSessionLocal()
+        reviews_count_2 = db.query(ActionReview).filter(ActionReview.action_id == action_id).count()
+        db.close()
+        assert reviews_count_2 == reviews_count_1
+
+    def test_reject_idempotent(self, client, admin_a_headers):
+        """Rejecting an already rejected action returns 200 without additional writes."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Reject Idempotent Test", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # First reject
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={"comment": "First rejection"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "rejected"
+
+        # Get usage after first reject
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        rejected_after_first = next(
+            (b for b in breakdown if b["event_key"] == "action_rejected"),
+            {"raw_units": 0}
+        )
+
+        # Second reject (idempotent)
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={"comment": "Second rejection attempt"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "rejected"
+
+        # Usage should NOT have incremented
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        rejected_after_second = next(
+            (b for b in breakdown if b["event_key"] == "action_rejected"),
+            {"raw_units": 0}
+        )
+        assert rejected_after_second["raw_units"] == rejected_after_first["raw_units"]
+
+
+class TestActionsApprovalsV0ConflictTransitions:
+    """Test conflict transition returns 409 (Phase 1 Task 8b)."""
+
+    def test_approve_then_reject_returns_409(self, client, admin_a_headers):
+        """After approving, trying to reject returns 409 Conflict."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Approve Then Reject", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Approve
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Try to reject -> 409
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert "approved" in response.json()["detail"].lower()
+
+    def test_reject_then_approve_returns_409(self, client, admin_a_headers):
+        """After rejecting, trying to approve returns 409 Conflict."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Reject Then Approve", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Reject
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Try to approve -> 409
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert "rejected" in response.json()["detail"].lower()
+
+    def test_cancelled_action_cannot_be_approved(self, client, admin_a_headers):
+        """A cancelled action cannot be approved (returns 409)."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Cancel", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Try to approve -> 409
+        response = client.post(
+            f"/v1/actions/{action_id}/approve",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert "cancelled" in response.json()["detail"].lower()
+
+    def test_cancelled_action_cannot_be_rejected(self, client, admin_a_headers):
+        """A cancelled action cannot be rejected (returns 409)."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Cancel 2", "action_type": "general", "payload": {}},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Try to reject -> 409
+        response = client.post(
+            f"/v1/actions/{action_id}/reject",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert "cancelled" in response.json()["detail"].lower()
+
+
+class TestActionsApprovalsV0QuotaEnforcement:
+    """Test quota enforcement for approve (Phase 1 Task 8b)."""
+
+    def test_approve_quota_exceeded_returns_429_no_partial_writes(self, client, tenant_a, admin_a_headers):
+        """When approve quota exceeded, returns 429 and no partial writes happen."""
+        platform_headers = {"X-Platform-Admin-Key": "test-admin-key"}
+
+        # Create a test plan with cap of 1 for action_approved
+        response = client.post(
+            "/v1/admin/plans",
+            json={
+                "plan_id": "test_approve_limited",
+                "name": "Approve Limited",
+                "included_credits": 1000,
+                "overage_price_per_credit": 0.02,
+            },
+            headers=platform_headers,
+        )
+        assert response.status_code in [200, 201, 409]
+
+        # Add capabilities
+        client.put(
+            "/v1/admin/plans/test_approve_limited/capabilities",
+            json={"capabilities": ["action_center", "timeline"]},
+            headers=platform_headers,
+        )
+
+        # Add event cap of 1 for action_approved
+        client.put(
+            "/v1/admin/plans/test_approve_limited/caps",
+            json={
+                "caps": [
+                    {"event_key": "action_approved", "period": "monthly", "cap_raw_units": 1}
+                ]
+            },
+            headers=platform_headers,
+        )
+
+        # Assign the limited plan to the tenant
+        client.put(
+            f"/v1/admin/tenants/{tenant_a['tenant_id']}/subscription",
+            json={"plan_id": "test_approve_limited", "status": "active"},
+            headers=platform_headers,
+        )
+
+        # Create two actions
+        response = client.post(
+            "/v1/actions",
+            json={"title": "First Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id_1 = response.json()["action_id"]
+
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Second Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id_2 = response.json()["action_id"]
+
+        # First approve should succeed
+        response = client.post(
+            f"/v1/actions/{action_id_1}/approve",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Second approve should fail with 429
+        response = client.post(
+            f"/v1/actions/{action_id_2}/approve",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 429
+
+        # Verify second action remains "proposed"
+        response = client.get(f"/v1/actions/{action_id_2}", headers=admin_a_headers)
+        assert response.json()["status"] == "proposed"
+
+        # Verify no action_reviews row for second action
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionReview
+        reviews_for_second = db.query(ActionReview).filter(
+            ActionReview.action_id == action_id_2
+        ).count()
+        assert reviews_for_second == 0
+        db.close()
+
+        # Verify no additional timeline event for second action approval
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id_2}",
+            headers=admin_a_headers,
+        )
+        events = response.json()["items"]
+        approved_events = [e for e in events if e["event_type"] == "action_approved"]
+        assert len(approved_events) == 0
+
+
+class TestActionsApprovalsV0ListFilters:
+    """Test list endpoint filters for approved/rejected status (Phase 1 Task 8b)."""
+
+    def test_list_status_filter_approved(self, client, admin_a_headers):
+        """Can filter by status=approved."""
+        # Create and approve an action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Approve", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Create another action that stays proposed
+        client.post(
+            "/v1/actions",
+            json={"title": "Stay Proposed", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # List approved only
+        response = client.get("/v1/actions?status=approved", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) >= 1
+        assert all(a["status"] == "approved" for a in items)
+
+    def test_list_status_filter_rejected(self, client, admin_a_headers):
+        """Can filter by status=rejected."""
+        # Create and reject an action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Reject", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/reject", json={}, headers=admin_a_headers)
+
+        # List rejected only
+        response = client.get("/v1/actions?status=rejected", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) >= 1
+        assert all(a["status"] == "rejected" for a in items)
