@@ -13,10 +13,9 @@ Provides APIs for:
 """
 import json
 import uuid
-from datetime import datetime, timezone
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -33,13 +32,11 @@ from app.gateway.models import (
     EvidenceLink,
     TimelineEvent,
     AuditLog,
-    GatewayTenant,
-    GatewayUser,
 )
+from app.gateway.auth import TenantContext, get_tenant_context, require_admin
 from app.gateway.entitlements import check_entitlement, check_quota as check_billing_quota
 from app.gateway.metering import emit_usage
 from app.gateway.billing_period import get_current_utc_datetime_iso
-import secrets
 
 router = APIRouter(prefix="/v1", tags=["core-os"])
 
@@ -370,46 +367,6 @@ class RecordExplorerResponse(BaseModel):
 
 
 # =============================================================================
-# Auth Context
-# =============================================================================
-
-class TenantContext:
-    """Tenant context populated from request headers."""
-    def __init__(self, tenant_id: str, user_id: str, tenant: GatewayTenant, user: GatewayUser):
-        self.tenant_id = tenant_id
-        self.user_id = user_id
-        self.tenant = tenant
-        self.user = user
-
-
-def get_tenant_context(
-    x_tenant_id: Annotated[str | None, Header()] = None,
-    x_user_id: Annotated[str | None, Header()] = None,
-    x_api_key: Annotated[str | None, Header()] = None,
-    db: Session = Depends(get_db),
-) -> TenantContext:
-    """Validate headers and return tenant context."""
-    if not x_tenant_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required header: X-Tenant-ID")
-    if not x_user_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required header: X-User-ID")
-    if not x_api_key:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing required header: X-API-Key")
-
-    tenant = db.query(GatewayTenant).filter(GatewayTenant.tenant_id == x_tenant_id).first()
-    if not tenant or not secrets.compare_digest(tenant.api_key, x_api_key):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid tenant ID or API key")
-
-    user = db.query(GatewayUser).filter(GatewayUser.user_id == x_user_id).first()
-    if not user:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User not found")
-    if user.tenant_id != x_tenant_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User does not belong to this tenant")
-
-    return TenantContext(tenant_id=x_tenant_id, user_id=x_user_id, tenant=tenant, user=user)
-
-
-# =============================================================================
 # Helper Functions
 # =============================================================================
 
@@ -458,15 +415,6 @@ def log_audit(
     )
     db.add(audit)
     return audit
-
-
-def require_admin(context: TenantContext) -> None:
-    """Require admin role, raise 403 if not admin."""
-    if context.user.role != "admin":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Role '{context.user.role}' is not authorized for this action"
-        )
 
 
 # =============================================================================

@@ -15,10 +15,10 @@ from app.gateway.models import (
     TenantSubscription,
     UsageEvent,
     UsageRollupPeriod,
-    GatewayTenant,
-    GatewayUser,
     Capability,
+    GatewayTenant,
 )
+from app.gateway.auth import TenantContext, get_tenant_context
 from app.gateway.schemas import (
     MeteredEventTypeCreate,
     MeteredEventTypeUpdate,
@@ -86,58 +86,17 @@ def verify_platform_admin(
 
 
 # =============================================================================
-# Tenant Authentication (reused from main router)
+# Tenant Authentication (using shared auth module)
 # =============================================================================
 
 def get_tenant_context_for_billing(
-    x_tenant_id: Annotated[str | None, Header()] = None,
-    x_user_id: Annotated[str | None, Header()] = None,
-    x_api_key: Annotated[str | None, Header()] = None,
-    db: Session = Depends(get_db),
+    context: TenantContext = Depends(get_tenant_context),
 ) -> tuple[str, str]:
-    """Validate headers and return (tenant_id, user_id) for billing endpoints."""
-    if not x_tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-Tenant-ID",
-        )
-    if not x_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-User-ID",
-        )
-    if not x_api_key:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Missing required header: X-API-Key",
-        )
+    """Wrapper that returns (tenant_id, user_id) for backward compatibility.
 
-    # Authenticate: verify tenant exists and API key matches
-    tenant = db.query(GatewayTenant).filter(
-        GatewayTenant.tenant_id == x_tenant_id
-    ).first()
-    if not tenant or not secrets.compare_digest(tenant.api_key, x_api_key):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid tenant ID or API key",
-        )
-
-    # Authorize: verify user exists and belongs to tenant
-    user = db.query(GatewayUser).filter(
-        GatewayUser.user_id == x_user_id
-    ).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User not found",
-        )
-    if user.tenant_id != x_tenant_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User does not belong to this tenant",
-        )
-
-    return x_tenant_id, x_user_id
+    Uses the shared authentication from app.gateway.auth.
+    """
+    return context.tenant_id, context.user_id
 
 
 # =============================================================================
