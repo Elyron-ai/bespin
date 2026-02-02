@@ -1,10 +1,11 @@
 """Dev Console for viewing database state."""
+import html
 import os
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import APIRouter, Cookie, Depends, HTTPException, Query, Request, Response, status
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -83,14 +84,27 @@ ALLOWED_TABLES = {
 }
 
 
-def verify_console_access(key: str = Query(...)):
-    """Verify console access is enabled and key is valid."""
+def verify_console_access(
+    key: str | None = Query(None),
+    console_session: str | None = Cookie(None),
+):
+    """Verify console access is enabled and key is valid.
+
+    Accepts either a URL query parameter 'key' or a session cookie.
+    This avoids exposing the key in every link in the HTML.
+    """
     if not DEV_CONSOLE_ENABLED:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    # Use constant-time comparison to prevent timing attacks
-    if not secrets.compare_digest(key, DEV_CONSOLE_KEY):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-    return True
+
+    # Check session cookie first (for already authenticated sessions)
+    if console_session and secrets.compare_digest(console_session, DEV_CONSOLE_KEY):
+        return True
+
+    # Check URL parameter (for initial authentication)
+    if key and secrets.compare_digest(key, DEV_CONSOLE_KEY):
+        return True
+
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
 
 def mask_api_key(api_key: str) -> str:
@@ -101,12 +115,18 @@ def mask_api_key(api_key: str) -> str:
 
 
 def html_page(title: str, content: str) -> str:
-    """Wrap content in a basic HTML page."""
+    """Wrap content in a basic HTML page.
+
+    Note: Links use cookie-based auth so no key parameter needed in URLs.
+    The title is HTML-escaped to prevent XSS.
+    """
+    # Escape the title to prevent XSS
+    safe_title = html.escape(title)
     return f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>{title} - Bespin Dev Console</title>
+    <title>{safe_title} - Bespin Dev Console</title>
     <style>
         body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 20px; background: #f5f5f5; }}
         h1 {{ color: #333; }}
@@ -129,34 +149,58 @@ def html_page(title: str, content: str) -> str:
 </head>
 <body>
     <div class="nav">
-        <a href="/console?key={DEV_CONSOLE_KEY}">Overview</a>
-        <a href="/console/tenants?key={DEV_CONSOLE_KEY}">Tenants</a>
-        <a href="/console/billing?key={DEV_CONSOLE_KEY}">Billing</a>
-        <a href="/console/core-os?key={DEV_CONSOLE_KEY}">Core OS</a>
-        <a href="/console/db/tenants?key={DEV_CONSOLE_KEY}">Tables</a>
-        <a href="/console/db/download?key={DEV_CONSOLE_KEY}">Download DB</a>
+        <a href="/console">Overview</a>
+        <a href="/console/tenants">Tenants</a>
+        <a href="/console/billing">Billing</a>
+        <a href="/console/core-os">Core OS</a>
+        <a href="/console/db/tenants">Tables</a>
+        <a href="/console/db/download">Download DB</a>
     </div>
-    <h1>{title}</h1>
+    <h1>{safe_title}</h1>
     {content}
 </body>
 </html>"""
 
 
 def format_value(val: Any) -> str:
-    """Format a value for HTML display."""
+    """Format a value for HTML display with proper XSS escaping."""
     if val is None:
         return "<em>null</em>"
-    if isinstance(val, str) and len(val) > 100:
-        return f'<span class="truncate" title="{val[:500]}">{val[:100]}...</span>'
-    return str(val)
+    # Convert to string and escape HTML entities to prevent XSS
+    str_val = str(val)
+    escaped = html.escape(str_val)
+    if len(str_val) > 100:
+        # Also escape the title attribute
+        title_escaped = html.escape(str_val[:500])
+        return f'<span class="truncate" title="{title_escaped}">{html.escape(str_val[:100])}...</span>'
+    return escaped
+
+
+def set_session_cookie(response: Response, key: str | None) -> None:
+    """Set session cookie if authenticated via key parameter."""
+    if key:
+        # Set HTTP-only cookie to avoid exposing key in subsequent requests
+        response.set_cookie(
+            key="console_session",
+            value=DEV_CONSOLE_KEY,
+            httponly=True,
+            samesite="strict",
+            secure=False,  # Set to True in production with HTTPS
+            max_age=3600,  # 1 hour session
+        )
 
 
 @router.get("", response_class=HTMLResponse)
 def console_overview(
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """Dev console overview with counts."""
+    # Set session cookie if authenticated via key
+    set_session_cookie(response, key)
+
     counts = {
         "Tenants": db.query(func.count(GatewayTenant.tenant_id)).scalar() or 0,
         "Users": db.query(func.count(GatewayUser.user_id)).scalar() or 0,
@@ -195,7 +239,7 @@ def console_overview(
 
     tables_html = "<h2>Browse Tables</h2><ul>"
     for table_name in ALLOWED_TABLES.keys():
-        tables_html += f'<li><a href="/console/db/{table_name}?key={DEV_CONSOLE_KEY}">{table_name}</a></li>'
+        tables_html += f'<li><a href="/console/db/{html.escape(table_name)}">{html.escape(table_name)}</a></li>'
     tables_html += "</ul>"
 
     content = f"""
@@ -211,21 +255,24 @@ def console_overview(
 
 @router.get("/tenants", response_class=HTMLResponse)
 def console_tenants(
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """List all tenants."""
+    set_session_cookie(response, key)
     tenants = db.query(GatewayTenant).order_by(GatewayTenant.created_at.desc()).all()
 
     rows_html = ""
     for t in tenants:
         rows_html += f"""
         <tr>
-            <td><a href="/console/tenants/{t.tenant_id}?key={DEV_CONSOLE_KEY}">{t.tenant_id}</a></td>
-            <td>{t.name}</td>
-            <td>{t.region}</td>
-            <td class="truncate">{mask_api_key(t.api_key)}</td>
-            <td>{t.created_at}</td>
+            <td><a href="/console/tenants/{html.escape(t.tenant_id)}">{html.escape(t.tenant_id)}</a></td>
+            <td>{html.escape(t.name)}</td>
+            <td>{html.escape(t.region or '')}</td>
+            <td class="truncate">{html.escape(mask_api_key(t.api_key))}</td>
+            <td>{html.escape(t.created_at)}</td>
         </tr>
         """
 
@@ -248,10 +295,13 @@ def console_tenants(
 @router.get("/tenants/{tenant_id}", response_class=HTMLResponse)
 def console_tenant_detail(
     tenant_id: str,
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """Show tenant detail: users, KPIs, briefs, outbox."""
+    set_session_cookie(response, key)
     tenant = db.query(GatewayTenant).filter(GatewayTenant.tenant_id == tenant_id).first()
     if not tenant:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
@@ -260,21 +310,21 @@ def console_tenant_detail(
     users = db.query(GatewayUser).filter(GatewayUser.tenant_id == tenant_id).all()
     users_html = "<table><tr><th>User ID</th><th>Email</th><th>Role</th><th>Created At</th></tr>"
     for u in users:
-        users_html += f"<tr><td>{u.user_id}</td><td>{u.email}</td><td>{u.role}</td><td>{u.created_at}</td></tr>"
+        users_html += f"<tr><td>{html.escape(u.user_id)}</td><td>{html.escape(u.email)}</td><td>{html.escape(u.role)}</td><td>{html.escape(u.created_at)}</td></tr>"
     users_html += "</table>"
 
     # KPIs
     kpis = db.query(KPIDefinition).filter(KPIDefinition.tenant_id == tenant_id).all()
     kpis_html = "<table><tr><th>KPI ID</th><th>Name</th><th>Unit</th><th>Description</th></tr>"
     for k in kpis:
-        kpis_html += f"<tr><td>{k.kpi_id}</td><td>{k.name}</td><td>{k.unit or ''}</td><td>{k.description or ''}</td></tr>"
+        kpis_html += f"<tr><td>{html.escape(k.kpi_id)}</td><td>{html.escape(k.name)}</td><td>{html.escape(k.unit or '')}</td><td>{html.escape(k.description or '')}</td></tr>"
     kpis_html += "</table>"
 
     # Recent briefs
     briefs = db.query(Brief).filter(Brief.tenant_id == tenant_id).order_by(Brief.brief_date.desc()).limit(5).all()
     briefs_html = "<table><tr><th>Brief ID</th><th>Date</th><th>Window Days</th><th>Top N</th><th>Created At</th></tr>"
     for b in briefs:
-        briefs_html += f"<tr><td>{b.brief_id}</td><td>{b.brief_date}</td><td>{b.window_days}</td><td>{b.top_n}</td><td>{b.created_at}</td></tr>"
+        briefs_html += f"<tr><td>{html.escape(b.brief_id)}</td><td>{html.escape(b.brief_date)}</td><td>{b.window_days}</td><td>{b.top_n}</td><td>{html.escape(b.created_at)}</td></tr>"
     briefs_html += "</table>"
 
     # Recent outbox
@@ -283,7 +333,7 @@ def console_tenant_detail(
     ).order_by(NotificationOutbox.created_at.desc()).limit(10).all()
     outbox_html = "<table><tr><th>ID</th><th>User ID</th><th>Type</th><th>Date</th><th>Status</th></tr>"
     for o in outbox:
-        outbox_html += f"<tr><td>{o.id}</td><td>{o.user_id}</td><td>{o.notification_type}</td><td>{o.notif_date}</td><td>{o.status}</td></tr>"
+        outbox_html += f"<tr><td>{o.id}</td><td>{html.escape(o.user_id)}</td><td>{html.escape(o.notification_type)}</td><td>{html.escape(o.notif_date)}</td><td>{html.escape(o.status)}</td></tr>"
     outbox_html += "</table>"
 
     # Subscription
@@ -296,9 +346,9 @@ def console_tenant_detail(
         sub_html = f"""
         <div class="card">
             <h2>Subscription</h2>
-            <p><strong>Plan:</strong> <a href="/console/billing/plans/{subscription.plan_id}?key={DEV_CONSOLE_KEY}">{subscription.plan_id}</a> ({sub_plan.name if sub_plan else 'Unknown'})</p>
-            <p><strong>Status:</strong> {subscription.status}</p>
-            <p><strong>Period:</strong> {subscription.period_start} to {subscription.period_end}</p>
+            <p><strong>Plan:</strong> <a href="/console/billing/plans/{html.escape(subscription.plan_id)}">{html.escape(subscription.plan_id)}</a> ({html.escape(sub_plan.name) if sub_plan else 'Unknown'})</p>
+            <p><strong>Status:</strong> {html.escape(subscription.status)}</p>
+            <p><strong>Period:</strong> {html.escape(subscription.period_start)} to {html.escape(subscription.period_end)}</p>
             <p><strong>Included Credits:</strong> {sub_plan.included_credits if sub_plan else 'N/A'}</p>
         </div>
         """
@@ -314,8 +364,8 @@ def console_tenant_detail(
         <tr><th>Period Start</th><th>Event Key</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>"""
     for r in rollups:
         rollups_html += f"""<tr>
-            <td>{r.period_start}</td>
-            <td>{r.event_key}</td>
+            <td>{html.escape(r.period_start)}</td>
+            <td>{html.escape(r.event_key)}</td>
             <td>{r.raw_units:.2f}</td>
             <td>{r.credits:.2f}</td>
             <td>${r.list_cost_estimate:.4f}</td>
@@ -325,11 +375,11 @@ def console_tenant_detail(
     content = f"""
     <div class="card">
         <h2>Tenant Info</h2>
-        <p><strong>ID:</strong> {tenant.tenant_id}</p>
-        <p><strong>Name:</strong> {tenant.name}</p>
-        <p><strong>Region:</strong> {tenant.region}</p>
-        <p><strong>API Key:</strong> <code>{mask_api_key(tenant.api_key)}</code></p>
-        <p><strong>Created:</strong> {tenant.created_at}</p>
+        <p><strong>ID:</strong> {html.escape(tenant.tenant_id)}</p>
+        <p><strong>Name:</strong> {html.escape(tenant.name)}</p>
+        <p><strong>Region:</strong> {html.escape(tenant.region or '')}</p>
+        <p><strong>API Key:</strong> <code>{html.escape(mask_api_key(tenant.api_key))}</code></p>
+        <p><strong>Created:</strong> {html.escape(tenant.created_at)}</p>
     </div>
 
     {sub_html}
@@ -355,19 +405,23 @@ def console_tenant_detail(
 
 @router.get("/billing", response_class=HTMLResponse)
 def console_billing(
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """Billing overview: metered events, plans, subscriptions."""
+    set_session_cookie(response, key)
+
     # Metered event types
     events = db.query(MeteredEventType).order_by(MeteredEventType.event_key).all()
     events_html = """<table>
         <tr><th>Event Key</th><th>Display Name</th><th>Unit</th><th>Credits/Unit</th><th>Price/Credit</th><th>Billable</th><th>Active</th></tr>"""
     for e in events:
         events_html += f"""<tr>
-            <td>{e.event_key}</td>
-            <td>{e.display_name}</td>
-            <td>{e.unit_name}</td>
+            <td>{html.escape(e.event_key)}</td>
+            <td>{html.escape(e.display_name)}</td>
+            <td>{html.escape(e.unit_name)}</td>
             <td>{e.credits_per_unit}</td>
             <td>${e.list_price_per_credit}</td>
             <td>{'Yes' if e.billable else 'No'}</td>
@@ -381,8 +435,8 @@ def console_billing(
         <tr><th>Plan ID</th><th>Name</th><th>Included Credits</th><th>Overage Price</th></tr>"""
     for p in plans:
         plans_html += f"""<tr>
-            <td><a href="/console/billing/plans/{p.plan_id}?key={DEV_CONSOLE_KEY}">{p.plan_id}</a></td>
-            <td>{p.name}</td>
+            <td><a href="/console/billing/plans/{html.escape(p.plan_id)}">{html.escape(p.plan_id)}</a></td>
+            <td>{html.escape(p.name)}</td>
             <td>{p.included_credits}</td>
             <td>${p.overage_price_per_credit}</td>
         </tr>"""
@@ -394,11 +448,11 @@ def console_billing(
         <tr><th>Tenant ID</th><th>Plan</th><th>Status</th><th>Period Start</th><th>Period End</th></tr>"""
     for s in subscriptions:
         subs_html += f"""<tr>
-            <td><a href="/console/tenants/{s.tenant_id}?key={DEV_CONSOLE_KEY}">{s.tenant_id[:8]}...</a></td>
-            <td>{s.plan_id}</td>
-            <td>{s.status}</td>
-            <td>{s.period_start}</td>
-            <td>{s.period_end}</td>
+            <td><a href="/console/tenants/{html.escape(s.tenant_id)}">{html.escape(s.tenant_id[:8])}...</a></td>
+            <td>{html.escape(s.plan_id)}</td>
+            <td>{html.escape(s.status)}</td>
+            <td>{html.escape(s.period_start)}</td>
+            <td>{html.escape(s.period_end)}</td>
         </tr>"""
     subs_html += "</table>"
 
@@ -411,9 +465,9 @@ def console_billing(
         <tr><th>Tenant ID</th><th>Period Start</th><th>Event Key</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>"""
     for r in rollups:
         rollups_html += f"""<tr>
-            <td>{r.tenant_id[:8]}...</td>
-            <td>{r.period_start}</td>
-            <td>{r.event_key}</td>
+            <td>{html.escape(r.tenant_id[:8])}...</td>
+            <td>{html.escape(r.period_start)}</td>
+            <td>{html.escape(r.event_key)}</td>
             <td>{r.raw_units:.2f}</td>
             <td>{r.credits:.2f}</td>
             <td>${r.list_cost_estimate:.4f}</td>
@@ -448,10 +502,13 @@ def console_billing(
 @router.get("/billing/plans/{plan_id}", response_class=HTMLResponse)
 def console_plan_detail(
     plan_id: str,
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """Plan detail: capabilities and event caps."""
+    set_session_cookie(response, key)
     plan = db.query(Plan).filter(Plan.plan_id == plan_id).first()
     if not plan:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
@@ -460,7 +517,7 @@ def console_plan_detail(
     caps = db.query(PlanCapability).filter(PlanCapability.plan_id == plan_id).all()
     caps_html = "<ul>"
     for c in caps:
-        caps_html += f"<li>{c.capability_key}</li>"
+        caps_html += f"<li>{html.escape(c.capability_key)}</li>"
     caps_html += "</ul>" if caps else "<p>No capabilities assigned.</p>"
 
     # Event caps
@@ -469,8 +526,8 @@ def console_plan_detail(
         <tr><th>Event Key</th><th>Period</th><th>Cap (Raw Units)</th></tr>"""
     for ec in event_caps:
         event_caps_html += f"""<tr>
-            <td>{ec.event_key}</td>
-            <td>{ec.period}</td>
+            <td>{html.escape(ec.event_key)}</td>
+            <td>{html.escape(ec.period)}</td>
             <td>{ec.cap_raw_units}</td>
         </tr>"""
     event_caps_html += "</table>" if event_caps else "<p>No event caps.</p>"
@@ -478,8 +535,8 @@ def console_plan_detail(
     content = f"""
     <div class="card">
         <h2>Plan Info</h2>
-        <p><strong>ID:</strong> {plan.plan_id}</p>
-        <p><strong>Name:</strong> {plan.name}</p>
+        <p><strong>ID:</strong> {html.escape(plan.plan_id)}</p>
+        <p><strong>Name:</strong> {html.escape(plan.name)}</p>
         <p><strong>Included Credits:</strong> {plan.included_credits}</p>
         <p><strong>Overage Price:</strong> ${plan.overage_price_per_credit}/credit</p>
     </div>
@@ -497,25 +554,29 @@ def console_plan_detail(
 @router.get("/db/{table}", response_class=HTMLResponse)
 def console_table_viewer(
     table: str,
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
     limit: int = Query(200, ge=1, le=1000),
 ) -> str:
     """View rows from a specific table."""
+    set_session_cookie(response, key)
     if table not in ALLOWED_TABLES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Table not allowed")
 
     model = ALLOWED_TABLES[table]
     rows = db.query(model).limit(limit).all()
 
+    safe_table = html.escape(table)
     if not rows:
         content = "<p>No rows found.</p>"
-        return html_page(f"Table: {table}", content)
+        return html_page(f"Table: {safe_table}", content)
 
     # Get column names from the first row
     columns = [c.name for c in model.__table__.columns]
 
-    header_html = "".join(f"<th>{col}</th>" for col in columns)
+    header_html = "".join(f"<th>{html.escape(col)}</th>" for col in columns)
     rows_html = ""
     for row in rows:
         cells = "".join(f"<td>{format_value(getattr(row, col))}</td>" for col in columns)
@@ -523,7 +584,7 @@ def console_table_viewer(
 
     # Table navigation
     tables_nav = " | ".join(
-        f'<a href="/console/db/{t}?key={DEV_CONSOLE_KEY}">{t}</a>'
+        f'<a href="/console/db/{html.escape(t)}">{html.escape(t)}</a>'
         for t in ALLOWED_TABLES.keys()
     )
 
@@ -536,27 +597,31 @@ def console_table_viewer(
     </table>
     """
 
-    return html_page(f"Table: {table}", content)
+    return html_page(f"Table: {safe_table}", content)
 
 
 @router.get("/core-os", response_class=HTMLResponse)
 def console_core_os(
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
     db: Session = Depends(get_db),
 ) -> str:
     """Core Business OS overview: actions, tasks, decisions, memory, timeline."""
+    set_session_cookie(response, key)
+
     # Actions
     actions = db.query(Action).order_by(Action.created_at.desc()).limit(20).all()
     actions_html = """<table>
         <tr><th>Action ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Type</th><th>Created At</th></tr>"""
     for a in actions:
         actions_html += f"""<tr>
-            <td>{a.action_id[:8]}...</td>
-            <td><a href="/console/tenants/{a.tenant_id}?key={DEV_CONSOLE_KEY}">{a.tenant_id[:8]}...</a></td>
-            <td>{a.title[:50]}...</td>
-            <td>{a.status}</td>
-            <td>{a.action_type}</td>
-            <td>{a.created_at}</td>
+            <td>{html.escape(a.action_id[:8])}...</td>
+            <td><a href="/console/tenants/{html.escape(a.tenant_id)}">{html.escape(a.tenant_id[:8])}...</a></td>
+            <td>{html.escape(a.title[:50])}...</td>
+            <td>{html.escape(a.status)}</td>
+            <td>{html.escape(a.action_type)}</td>
+            <td>{html.escape(a.created_at)}</td>
         </tr>"""
     actions_html += "</table>"
 
@@ -566,12 +631,12 @@ def console_core_os(
         <tr><th>Task ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Priority</th><th>Due Date</th></tr>"""
     for t in tasks:
         tasks_html += f"""<tr>
-            <td>{t.task_id[:8]}...</td>
-            <td>{t.tenant_id[:8]}...</td>
-            <td>{t.title[:50]}...</td>
-            <td>{t.status}</td>
-            <td>{t.priority}</td>
-            <td>{t.due_date or '-'}</td>
+            <td>{html.escape(t.task_id[:8])}...</td>
+            <td>{html.escape(t.tenant_id[:8])}...</td>
+            <td>{html.escape(t.title[:50])}...</td>
+            <td>{html.escape(t.status)}</td>
+            <td>{html.escape(t.priority)}</td>
+            <td>{html.escape(t.due_date or '-')}</td>
         </tr>"""
     tasks_html += "</table>"
 
@@ -581,11 +646,11 @@ def console_core_os(
         <tr><th>Decision ID</th><th>Tenant</th><th>Title</th><th>Status</th><th>Date</th></tr>"""
     for d in decisions:
         decisions_html += f"""<tr>
-            <td>{d.decision_id[:8]}...</td>
-            <td>{d.tenant_id[:8]}...</td>
-            <td>{d.title[:50]}...</td>
-            <td>{d.status}</td>
-            <td>{d.decision_date}</td>
+            <td>{html.escape(d.decision_id[:8])}...</td>
+            <td>{html.escape(d.tenant_id[:8])}...</td>
+            <td>{html.escape(d.title[:50])}...</td>
+            <td>{html.escape(d.status)}</td>
+            <td>{html.escape(d.decision_date)}</td>
         </tr>"""
     decisions_html += "</table>"
 
@@ -595,11 +660,11 @@ def console_core_os(
         <tr><th>Fact ID</th><th>Tenant</th><th>Category</th><th>Key</th><th>Status</th></tr>"""
     for f in facts:
         facts_html += f"""<tr>
-            <td>{f.fact_id[:8]}...</td>
-            <td>{f.tenant_id[:8]}...</td>
-            <td>{f.category}</td>
-            <td>{f.fact_key[:30]}...</td>
-            <td>{f.status}</td>
+            <td>{html.escape(f.fact_id[:8])}...</td>
+            <td>{html.escape(f.tenant_id[:8])}...</td>
+            <td>{html.escape(f.category)}</td>
+            <td>{html.escape(f.fact_key[:30])}...</td>
+            <td>{html.escape(f.status)}</td>
         </tr>"""
     facts_html += "</table>"
 
@@ -609,12 +674,12 @@ def console_core_os(
         <tr><th>Event ID</th><th>Tenant</th><th>Event Type</th><th>Entity</th><th>Summary</th><th>Created At</th></tr>"""
     for e in timeline:
         timeline_html += f"""<tr>
-            <td>{e.event_id[:8]}...</td>
-            <td>{e.tenant_id[:8]}...</td>
-            <td>{e.event_type}</td>
-            <td>{e.entity_type}/{e.entity_id[:8]}...</td>
-            <td>{e.summary[:40]}...</td>
-            <td>{e.created_at}</td>
+            <td>{html.escape(e.event_id[:8])}...</td>
+            <td>{html.escape(e.tenant_id[:8])}...</td>
+            <td>{html.escape(e.event_type)}</td>
+            <td>{html.escape(e.entity_type)}/{html.escape(e.entity_id[:8])}...</td>
+            <td>{html.escape(e.summary[:40])}...</td>
+            <td>{html.escape(e.created_at)}</td>
         </tr>"""
     timeline_html += "</table>"
 
@@ -650,9 +715,12 @@ def console_core_os(
 
 @router.get("/db/download")
 def console_download_db(
+    response: Response,
+    key: str | None = Query(None),
     _: bool = Depends(verify_console_access),
 ):
     """Download the SQLite database file."""
+    set_session_cookie(response, key)
     db_path = "./test.db"
     if not os.path.exists(db_path):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Database file not found")
