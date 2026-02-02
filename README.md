@@ -83,13 +83,14 @@ poetry run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 poetry run pytest tests/test_tools_invoke.py -v
 
 # Run smoke tests (server must be running)
-./scripts/smoke_phase0.sh         # KPI Store smoke test
-./scripts/smoke_phase0_item3.sh   # Daily Briefs smoke test
-./scripts/smoke_phase0_item4.sh   # Notifications + Runner smoke test
-./scripts/smoke_phase0_item5.sh   # Cofounder Chat smoke test
-./scripts/smoke_phase0_item6.sh   # Quota Enforcement smoke test
-./scripts/smoke_phase0_item7.sh   # Billing + Metering smoke test
-./scripts/smoke_core_os_v0.sh     # Core Business OS smoke test
+./scripts/smoke_phase0.sh                    # KPI Store smoke test
+./scripts/smoke_phase0_item3.sh              # Daily Briefs smoke test
+./scripts/smoke_phase0_item4.sh              # Notifications + Runner smoke test
+./scripts/smoke_phase0_item5.sh              # Cofounder Chat smoke test
+./scripts/smoke_phase0_item6.sh              # Quota Enforcement smoke test
+./scripts/smoke_phase0_item7.sh              # Billing + Metering smoke test
+./scripts/smoke_core_os_v0.sh                # Core Business OS smoke test
+./scripts/smoke_phase1_task8a_actions_v0.sh  # Actions v0 smoke test
 ```
 
 ## API Overview
@@ -135,9 +136,10 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `GET /app` | Core Business OS UI (requires PLAYGROUND_UI_ENABLED=1) |
 | **Core Business OS - Actions** | |
 | `POST /v1/actions` | Create action (proposed state) |
-| `GET /v1/actions` | List actions (optional status filter) |
+| `GET /v1/actions` | List actions (filters: status, created_by_user_id, assigned_to_user_id) |
 | `GET /v1/actions/{action_id}` | Get action by ID |
 | `PATCH /v1/actions/{action_id}` | Update action (creator or admin) |
+| `POST /v1/actions/{action_id}/cancel` | Cancel proposed action (creator or admin) |
 | `POST /v1/actions/{action_id}/approve` | Approve action (admin only) |
 | `POST /v1/actions/{action_id}/reject` | Reject action (admin only) |
 | `POST /v1/actions/{action_id}/execute` | Execute action (admin only) |
@@ -498,7 +500,7 @@ The Core Business OS provides primitives for managing business operations: actio
 
 | Entity | Create | Read | Update | Delete/Special |
 |--------|--------|------|--------|----------------|
-| **Actions** | Any user | Any user | Creator or admin | Approve/Reject/Execute: admin only |
+| **Actions** | Any user | Any user | Creator or admin | Cancel: creator or admin (proposed only); Approve/Reject/Execute: admin only |
 | **Tasks** | Any user | Any user | Any user | Complete: assignee or admin |
 | **Decisions** | Admin only | Any user | Admin only | - |
 | **Meetings** | Any user | Any user | Creator or admin | - |
@@ -555,6 +557,35 @@ The smoke test demonstrates:
 11. Fetching unified timeline
 12. Viewing billing usage for Core OS operations
 
+### Running the Actions v0 Smoke Test (Phase 1 Task 8a)
+
+```bash
+# Server must be running
+./scripts/smoke_phase1_task8a_actions_v0.sh
+```
+
+The Actions v0 smoke test demonstrates:
+1. Creating a tenant with admin and member users
+2. Member creates an action (status: proposed)
+3. Listing actions with status filters (proposed, cancelled, all)
+4. Member cancels their own action
+5. Verifying action status changed to cancelled
+6. Fetching billing usage to see action_created and action_updated events
+
+### Actions v0 Metered Events
+
+| Event Key | Unit | Credits/Unit | Description |
+|-----------|------|--------------|-------------|
+| `action_created` | record | 0.2 | Action created (any status) |
+| `action_updated` | record | 0.1 | Action updated (including cancel) |
+
+### Actions v0 Cancel RBAC Rules
+
+- **Member**: Can cancel their own proposed actions only
+- **Admin**: Can cancel any proposed action in the tenant
+- **Idempotent**: Cancelling an already cancelled action returns 200 without emitting usage/audit
+- **Cross-tenant**: Accessing another tenant's action returns 404 (not 403)
+
 ### Example: Action Workflow
 
 ```bash
@@ -587,6 +618,30 @@ curl -X POST http://localhost:8000/v1/actions/$ACTION_ID/execute \
   -H "X-User-ID: $ADMIN_ID" \
   -H "X-API-Key: $API_KEY" \
   -d '{"execution_status": "succeeded", "result": {"message": "Email sent"}}'
+```
+
+### Example: Cancel an Action
+
+```bash
+# Member cancels their own proposed action
+curl -X POST http://localhost:8000/v1/actions/$ACTION_ID/cancel \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $MEMBER_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"comment": "Deal moved to next quarter"}'
+
+# List cancelled actions
+curl "http://localhost:8000/v1/actions?status=cancelled" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+
+# List all actions (proposed + cancelled)
+curl "http://localhost:8000/v1/actions?status=all" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
 ```
 
 ### Example: Memory Facts (Admin Only)

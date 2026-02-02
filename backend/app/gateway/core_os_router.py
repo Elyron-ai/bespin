@@ -69,6 +69,11 @@ class ActionApproveReject(BaseModel):
     comment: str | None = None
 
 
+class ActionCancel(BaseModel):
+    """Request schema for cancelling an action."""
+    comment: str | None = None
+
+
 class ActionExecute(BaseModel):
     """Request schema for executing an action."""
     execution_status: str = Field(..., pattern="^(succeeded|failed|skipped)$")
@@ -494,18 +499,30 @@ def create_action(
 def list_actions(
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
-    status_filter: str | None = Query(None, alias="status"),
+    status_filter: str | None = Query("proposed", alias="status"),
+    created_by_user_id: str | None = None,
     assigned_to_user_id: str | None = None,
-    limit: int = Query(50, ge=1, le=100),
+    limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> ActionListResponse:
-    """List actions for the tenant."""
+    """List actions for the tenant.
+
+    Args:
+        status: Filter by status (proposed, cancelled, or all). Default: proposed.
+        created_by_user_id: Filter by creator.
+        assigned_to_user_id: Filter by assignee.
+        limit: Max results (1-200). Default: 50.
+        offset: Skip results for pagination.
+    """
     check_entitlement(db, context.tenant_id, "action_center")
 
     query = db.query(Action).filter(Action.tenant_id == context.tenant_id)
 
-    if status_filter:
+    # Filter by status (default "proposed", "all" returns everything)
+    if status_filter and status_filter != "all":
         query = query.filter(Action.status == status_filter)
+    if created_by_user_id:
+        query = query.filter(Action.created_by_user_id == created_by_user_id)
     if assigned_to_user_id:
         query = query.filter(Action.assigned_to_user_id == assigned_to_user_id)
 
@@ -625,6 +642,104 @@ def update_action(
         emit_usage(db, context.tenant_id, context.user_id, "action_updated", 1, request_id, "action_center")
         db.commit()
         db.refresh(action)
+
+    return ActionResponse(
+        action_id=action.action_id,
+        tenant_id=action.tenant_id,
+        created_by_user_id=action.created_by_user_id,
+        assigned_to_user_id=action.assigned_to_user_id,
+        source=action.source,
+        source_ref=action.source_ref,
+        status=action.status,
+        title=action.title,
+        description=action.description,
+        action_type=action.action_type,
+        payload=json.loads(action.payload_json),
+        created_at=action.created_at,
+        updated_at=action.updated_at,
+    )
+
+
+@router.post("/actions/{action_id}/cancel", response_model=ActionResponse)
+def cancel_action(
+    action_id: str,
+    cancel_data: ActionCancel,
+    context: Annotated[TenantContext, Depends(get_tenant_context)],
+    db: Session = Depends(get_db),
+) -> ActionResponse:
+    """Cancel an action.
+
+    RBAC Rules:
+    - Member can cancel their own proposed actions.
+    - Admin can cancel any proposed action in the tenant.
+
+    Idempotent: If action is already cancelled, returns 200 without emitting usage/audit.
+    """
+    request_id = str(uuid.uuid4())
+    check_entitlement(db, context.tenant_id, "action_center")
+
+    action = db.query(Action).filter(
+        Action.action_id == action_id,
+        Action.tenant_id == context.tenant_id
+    ).first()
+
+    if not action:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
+
+    # If already cancelled, return without emitting usage/audit (idempotent)
+    if action.status == "cancelled":
+        return ActionResponse(
+            action_id=action.action_id,
+            tenant_id=action.tenant_id,
+            created_by_user_id=action.created_by_user_id,
+            assigned_to_user_id=action.assigned_to_user_id,
+            source=action.source,
+            source_ref=action.source_ref,
+            status=action.status,
+            title=action.title,
+            description=action.description,
+            action_type=action.action_type,
+            payload=json.loads(action.payload_json),
+            created_at=action.created_at,
+            updated_at=action.updated_at,
+        )
+
+    # Can only cancel proposed actions
+    if action.status != "proposed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Can only cancel proposed actions"
+        )
+
+    # RBAC check
+    is_admin = context.user.role == "admin"
+    is_creator = action.created_by_user_id == context.user_id
+
+    if not is_admin and not is_creator:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to cancel this action"
+        )
+
+    # Quota check before write
+    check_billing_quota(db, context.tenant_id, "action_updated", 1)
+
+    # Perform the cancellation
+    action.status = "cancelled"
+    action.updated_at = get_current_utc_datetime_iso()
+
+    log_timeline_event(
+        db, context.tenant_id, context.user_id,
+        "action_cancelled", "action", action_id,
+        f"Action cancelled: {action.title}",
+        {"comment": cancel_data.comment}
+    )
+
+    log_audit(db, context.tenant_id, context.user_id, "actions.cancel", "action_center", request_id)
+    emit_usage(db, context.tenant_id, context.user_id, "action_updated", 1, request_id, "action_center")
+
+    db.commit()
+    db.refresh(action)
 
     return ActionResponse(
         action_id=action.action_id,
