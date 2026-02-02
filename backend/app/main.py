@@ -2,13 +2,26 @@ import os
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.database import engine, Base
+from app.database import engine, Base, SessionLocal
 from app.gateway import models as gateway_models  # noqa: F401 - import for table creation
 from app.gateway.router import router as gateway_router
+from app.gateway.billing_router import router as billing_router
 from app.console.router import router as console_router
 from app.playground.router import router as playground_router
+from app.gateway.billing_seed import seed_all_billing_data
 
 Base.metadata.create_all(bind=engine)
+
+# Seed billing data on startup
+def _seed_billing_data():
+    """Seed default billing data (metered events, plans, capabilities)."""
+    db = SessionLocal()
+    try:
+        seed_all_billing_data(db)
+    finally:
+        db.close()
+
+_seed_billing_data()
 
 app = FastAPI(title="Bespin Tool Invocation Gateway", version="0.1.0")
 
@@ -31,6 +44,7 @@ app.add_middleware(
 )
 
 app.include_router(gateway_router)
+app.include_router(billing_router)
 app.include_router(console_router)
 app.include_router(playground_router)
 

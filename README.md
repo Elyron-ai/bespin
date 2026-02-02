@@ -47,6 +47,16 @@ A minimal, verifiable MVP for the AI Co-Founder multi-tenant architecture.
 - Usage panel in Playground UI with warning indicators
 - Idempotent replays do NOT consume quota
 
+### Item 7: Plans + Entitlements + Metered Events + Weighted Costs
+- **Metered Event Catalog**: Define event types with credits/unit weights and list prices
+- **Plans**: Monthly billing with included credits and overage pricing
+- **Capabilities**: Per-plan feature entitlements (chat, tools, briefs, notifications, kpi_ingest, kpi_read)
+- **Tenant Subscriptions**: Auto-assign starter plan on tenant creation
+- **Credits-based Quotas**: Enforce monthly credit limits + optional per-event caps
+- **Usage Consumption**: Materialized monthly rollups with credits and estimated costs
+- **Platform Admin APIs**: Manage metered events, plans, and subscriptions
+- **Tenant Billing APIs**: View plan, usage, and ledger
+
 ## Quick Start
 
 ```bash
@@ -67,6 +77,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_phase0_item4.sh   # Notifications + Runner smoke test
 ./scripts/smoke_phase0_item5.sh   # Cofounder Chat smoke test
 ./scripts/smoke_phase0_item6.sh   # Quota Enforcement smoke test
+./scripts/smoke_phase0_item7.sh   # Billing + Metering smoke test
 ```
 
 ## API Overview
@@ -95,6 +106,19 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `GET /v1/limits` | Get tenant's daily quota limits |
 | `PUT /v1/limits` | Update tenant's daily quota limits (admin only) |
 | `GET /v1/usage/daily` | Get daily usage summary for the tenant |
+| `GET /v1/billing/events` | Get active metered event types |
+| `GET /v1/billing/plan` | Get tenant subscription with plan details |
+| `GET /v1/billing/usage` | Get billing usage (credits used, remaining, breakdown) |
+| `GET /v1/billing/ledger` | Get usage event ledger for the period |
+| `GET /v1/admin/metered-events` | List metered events (platform admin) |
+| `POST /v1/admin/metered-events` | Create metered event (platform admin) |
+| `PUT /v1/admin/metered-events/{event_key}` | Update metered event (platform admin) |
+| `GET /v1/admin/plans` | List plans (platform admin) |
+| `POST /v1/admin/plans` | Create plan (platform admin) |
+| `PUT /v1/admin/plans/{plan_id}` | Update plan (platform admin) |
+| `PUT /v1/admin/plans/{plan_id}/capabilities` | Set plan capabilities (platform admin) |
+| `PUT /v1/admin/plans/{plan_id}/caps` | Set plan event caps (platform admin) |
+| `PUT /v1/admin/tenants/{tenant_id}/subscription` | Update tenant subscription (platform admin) |
 | `GET /ui` | Playground UI (requires PLAYGROUND_UI_ENABLED=1) |
 
 See [backend/app/gateway/README.md](backend/app/gateway/README.md) for detailed API documentation.
@@ -285,6 +309,118 @@ curl http://localhost:8000/v1/usage/daily \
   -H "X-API-Key: $API_KEY"
 ```
 
+## Billing and Metering (Item #7)
+
+Bespin implements a usage-based billing system with credits, plans, and entitlements.
+
+### Platform Admin API
+
+Platform admin endpoints require the `X-Platform-Admin-Key` header. Set the key via environment variable:
+
+```bash
+export PLATFORM_ADMIN_KEY=your-admin-key
+```
+
+### Default Metered Events
+
+| Event Key | Unit | Credits/Unit | Price/Credit | Description |
+|-----------|------|--------------|--------------|-------------|
+| `assistant_query` | call | 1.0 | $0.02 | Chat message to assistant |
+| `tool_invocation` | call | 2.0 | $0.02 | Tool invoked via API |
+| `daily_brief_generated` | brief | 5.0 | $0.02 | Brief materialized |
+| `notification_enqueued` | notification | 0.2 | $0.02 | Notification queued |
+| `kpi_definition_created` | kpi | 0.5 | $0.02 | KPI definition created |
+| `kpi_points_ingested` | row | 0.001 | $0.02 | KPI data point ingested |
+
+### Default Plans
+
+| Plan ID | Name | Monthly Credits | Overage Price |
+|---------|------|-----------------|---------------|
+| `starter` | Starter | 500 | $0.02/credit |
+| `growth` | Growth | 2000 | $0.015/credit |
+| `scale` | Scale | 10000 | $0.01/credit |
+
+All plans include all capabilities by default. The `starter` plan has optional caps on `daily_brief_generated` (50/month) and `tool_invocation` (2000/month).
+
+### How Quotas Work
+
+1. **Credits Quota**: Total credits used in billing period must not exceed `plan.included_credits`
+2. **Per-Event Caps** (optional): Individual event types can have raw unit caps per period
+3. **Idempotency**: Replays with same `Idempotency-Key` return cached response WITHOUT consuming credits
+4. **Partial Enqueue**: Daily brief runner enqueues as many notifications as quota allows
+
+### Viewing Usage
+
+```bash
+# Get current plan and subscription
+curl http://localhost:8000/v1/billing/plan \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+
+# Get billing usage (credits used, remaining, breakdown by event)
+curl http://localhost:8000/v1/billing/usage \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $USER_ID" \
+  -H "X-API-Key: $API_KEY"
+```
+
+Example response:
+```json
+{
+  "period_start": "2026-02-01",
+  "period_end": "2026-03-01",
+  "plan": {"plan_id": "starter", "name": "Starter", "included_credits": 500, ...},
+  "credits": {
+    "included": 500,
+    "used": 23.4,
+    "remaining": 476.6,
+    "overage_credits": 0,
+    "estimated_overage_cost": 0.0,
+    "estimated_list_cost": 0.468
+  },
+  "breakdown": [
+    {"event_key": "assistant_query", "unit_name": "call", "raw_units": 12, "credits": 12.0, "list_cost_estimate": 0.24},
+    {"event_key": "tool_invocation", "unit_name": "call", "raw_units": 5, "credits": 10.0, "list_cost_estimate": 0.20}
+  ]
+}
+```
+
+### Changing Event Weights (Admin)
+
+Update the `credits_per_unit` for an event type to change how much it costs:
+
+```bash
+curl -X PUT http://localhost:8000/v1/admin/metered-events/assistant_query \
+  -H "Content-Type: application/json" \
+  -H "X-Platform-Admin-Key: $ADMIN_KEY" \
+  -d '{"credits_per_unit": 5.0}'
+```
+
+Changes take effect for NEW usage events only (existing events keep their original credits).
+
+### Assigning Plans (Admin)
+
+```bash
+curl -X PUT http://localhost:8000/v1/admin/tenants/$TENANT_ID/subscription \
+  -H "Content-Type: application/json" \
+  -H "X-Platform-Admin-Key: $ADMIN_KEY" \
+  -d '{"plan_id": "growth", "status": "active"}'
+```
+
+### Running the Billing Smoke Test
+
+```bash
+export PLATFORM_ADMIN_KEY=adminkey
+./scripts/smoke_phase0_item7.sh
+```
+
+The smoke test demonstrates:
+1. Creating a tenant and viewing initial usage
+2. Updating event weights and verifying consumption
+3. Testing quota enforcement with a limited plan
+4. Running the daily brief job with notification metering
+
 ## Tech Stack
 
 - Python 3.12+
@@ -308,7 +444,12 @@ bespin/
 │   │   │   ├── rbac.py          # Access control
 │   │   │   ├── idempotency.py   # Idempotency handling
 │   │   │   ├── briefs.py        # Brief generation logic
-│   │   │   └── quota.py         # Quota enforcement module
+│   │   │   ├── quota.py         # Legacy daily quota enforcement
+│   │   │   ├── billing_period.py # Billing period utilities
+│   │   │   ├── billing_seed.py  # Default billing data
+│   │   │   ├── billing_router.py # Admin + tenant billing APIs
+│   │   │   ├── metering.py      # Centralized usage emission
+│   │   │   └── entitlements.py  # Capability + credits quota enforcement
 │   │   ├── console/             # Dev Console UI
 │   │   │   └── router.py        # Console endpoints
 │   │   └── playground/          # Playground UI
@@ -320,5 +461,6 @@ bespin/
     ├── smoke_phase0_item3.sh    # Daily Briefs smoke test
     ├── smoke_phase0_item4.sh    # Notifications + Runner smoke test
     ├── smoke_phase0_item5.sh    # Cofounder Chat smoke test
-    └── smoke_phase0_item6.sh    # Quota Enforcement smoke test
+    ├── smoke_phase0_item6.sh    # Quota Enforcement smoke test
+    └── smoke_phase0_item7.sh    # Billing + Metering smoke test
 ```

@@ -42,6 +42,13 @@ from app.gateway.quota import (
     ACTIVITY_LIMIT_FIELD,
     DEFAULT_LIMITS,
 )
+from app.gateway.entitlements import (
+    check_entitlement,
+    check_quota as check_billing_quota,
+    create_tenant_subscription,
+    get_remaining_quota as get_remaining_billing_quota,
+)
+from app.gateway.metering import emit_usage
 from app.gateway.rbac import (
     can_invoke_tools,
     can_materialize_briefs,
@@ -231,6 +238,9 @@ def create_tenant(
     # Create default tenant limits
     create_default_limits(db, tenant_id)
 
+    # Create default subscription (starter plan)
+    create_tenant_subscription(db, tenant_id, plan_id="starter", status="active")
+
     db.commit()
     db.refresh(tenant)
     db.refresh(admin_user)
@@ -335,7 +345,10 @@ def invoke_tool(
             detail=f"Role '{context.user.role}' is not authorized to invoke tools",
         )
 
-    # Check idempotency
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "tools")
+
+    # Check idempotency BEFORE quota (replays must not consume quota)
     request_body = request.model_dump()
     try:
         cached_response = check_idempotency(
@@ -354,7 +367,10 @@ def invoke_tool(
             detail=str(e),
         )
 
-    # Check quota (after idempotency check, so replays don't consume quota)
+    # Check billing quota (credits + caps) - after idempotency check
+    check_billing_quota(db, context.tenant_id, "tool_invocation", requested_raw_units=1)
+
+    # Also check legacy daily quota for backward compatibility
     today = get_today_date_utc()
     check_quota(db, context.tenant_id, today, "tool_invocation", requested_units=1)
 
@@ -381,18 +397,18 @@ def invoke_tool(
     )
     db.add(audit_log)
 
-    # Write usage event
-    usage_event = UsageEvent(
+    # Emit usage via centralized metering (calculates credits + updates period rollup)
+    emit_usage(
+        db=db,
         tenant_id=context.tenant_id,
         user_id=context.user_id,
-        activity_type="tool_invocation",
-        units=1,
-        tool_name=request.tool_name,
+        event_key="tool_invocation",
+        raw_units=1,
         request_id=request_id,
+        tool_name=request.tool_name,
     )
-    db.add(usage_event)
 
-    # Increment usage rollup
+    # Increment legacy daily usage rollup for backward compatibility
     increment_usage(db, context.tenant_id, today, "tool_invocation", units=1)
 
     db.commit()
@@ -433,6 +449,14 @@ def create_kpi(
             detail=f"Role '{context.user.role}' is not authorized to create KPIs",
         )
 
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "kpi_ingest")
+
+    # Check billing quota before creating
+    check_billing_quota(db, context.tenant_id, "kpi_definition_created", requested_raw_units=1)
+
+    request_id = str(uuid.uuid4())
+
     kpi = KPIDefinition(
         kpi_id=str(uuid.uuid4()),
         tenant_id=context.tenant_id,
@@ -441,6 +465,17 @@ def create_kpi(
         description=kpi_data.description,
     )
     db.add(kpi)
+
+    # Emit usage via centralized metering
+    emit_usage(
+        db=db,
+        tenant_id=context.tenant_id,
+        user_id=context.user_id,
+        event_key="kpi_definition_created",
+        raw_units=1,
+        request_id=request_id,
+    )
+
     db.commit()
     db.refresh(kpi)
     return KPIResponse.model_validate(kpi)
@@ -468,6 +503,9 @@ def bulk_ingest_kpi_points(
             detail=f"Role '{context.user.role}' is not authorized to ingest KPI points",
         )
 
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "kpi_ingest")
+
     # Verify KPI exists and belongs to this tenant
     kpi = db.query(KPIDefinition).filter(
         KPIDefinition.kpi_id == kpi_id,
@@ -488,6 +526,13 @@ def bulk_ingest_kpi_points(
     ).all()
     existing_timestamps = {p.ts for p in existing_points}
 
+    # Calculate how many will be inserted (for quota check)
+    expected_inserts = sum(1 for p in request.points if p.ts not in existing_timestamps)
+
+    # Check billing quota for expected inserts
+    if expected_inserts > 0:
+        check_billing_quota(db, context.tenant_id, "kpi_points_ingested", requested_raw_units=expected_inserts)
+
     inserted = 0
     ignored = 0
 
@@ -503,6 +548,18 @@ def bulk_ingest_kpi_points(
             )
             db.add(kpi_point)
             inserted += 1
+
+    # Emit usage for actual inserted count
+    if inserted > 0:
+        request_id = str(uuid.uuid4())
+        emit_usage(
+            db=db,
+            tenant_id=context.tenant_id,
+            user_id=context.user_id,
+            event_key="kpi_points_ingested",
+            raw_units=inserted,
+            request_id=request_id,
+        )
 
     db.commit()
     return KPIPointsBulkResponse(inserted=inserted, ignored=ignored)
@@ -530,6 +587,9 @@ def list_kpis(
             detail=f"Role '{context.user.role}' is not authorized to read KPIs",
         )
 
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "kpi_read")
+
     # Enforce reasonable limits
     limit = min(max(1, limit), 500)
     offset = max(0, offset)
@@ -556,6 +616,9 @@ def get_kpi_latest(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Role '{context.user.role}' is not authorized to read KPIs",
         )
+
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "kpi_read")
 
     # Verify KPI exists and belongs to this tenant (for tenant isolation)
     kpi = db.query(KPIDefinition).filter(
@@ -610,6 +673,9 @@ def materialize_brief(
             detail=f"Role '{context.user.role}' is not authorized to materialize briefs",
         )
 
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "briefs")
+
     # Determine brief_date (default to today UTC if not provided)
     brief_date = request.date
     if brief_date is None:
@@ -622,7 +688,7 @@ def materialize_brief(
         "top_n": request.top_n,
     }
 
-    # Check idempotency
+    # Check idempotency BEFORE quota (replays must not consume quota)
     try:
         cached_response = check_idempotency(
             db=db,
@@ -664,7 +730,10 @@ def materialize_brief(
         )
         return response
 
-    # Brief will be newly created - check quota
+    # Brief will be newly created - check billing quota
+    check_billing_quota(db, context.tenant_id, "daily_brief_generated", requested_raw_units=1)
+
+    # Also check legacy daily quota for backward compatibility
     today = get_today_date_utc()
     check_quota(db, context.tenant_id, today, "daily_brief_generated", requested_units=1)
 
@@ -703,18 +772,18 @@ def materialize_brief(
     )
     db.add(audit_log)
 
-    # Write usage event
-    usage_event = UsageEvent(
+    # Emit usage via centralized metering
+    emit_usage(
+        db=db,
         tenant_id=context.tenant_id,
         user_id=context.user_id,
-        activity_type="daily_brief_generated",
-        units=1,
-        tool_name="daily_brief",
+        event_key="daily_brief_generated",
+        raw_units=1,
         request_id=request_id,
+        tool_name="daily_brief",
     )
-    db.add(usage_event)
 
-    # Increment usage rollup
+    # Increment legacy daily usage rollup for backward compatibility
     increment_usage(db, context.tenant_id, today, "daily_brief_generated", units=1)
 
     db.commit()
@@ -978,6 +1047,10 @@ def run_daily_brief_job(
             detail=f"Role '{context.user.role}' is not authorized to run jobs",
         )
 
+    # Check entitlements (briefs and notifications)
+    check_entitlement(db, context.tenant_id, "briefs")
+    check_entitlement(db, context.tenant_id, "notifications")
+
     # Determine brief_date (default to today UTC if not provided)
     brief_date = request.date
     if brief_date is None:
@@ -990,7 +1063,7 @@ def run_daily_brief_job(
         "top_n": request.top_n,
     }
 
-    # Check idempotency
+    # Check idempotency BEFORE quota (replays must not consume quota)
     try:
         cached_response = check_idempotency(
             db=db,
@@ -1007,7 +1080,7 @@ def run_daily_brief_job(
             detail=str(e),
         )
 
-    # Get today's date for quota checking
+    # Get today's date for legacy quota checking
     today = get_today_date_utc()
 
     # Ensure brief exists for this date
@@ -1021,7 +1094,10 @@ def run_daily_brief_job(
         brief_id = existing_brief.brief_id
         brief_content = json.loads(existing_brief.content_json)
     else:
-        # Brief will be newly created - check quota
+        # Brief will be newly created - check billing quota
+        check_billing_quota(db, context.tenant_id, "daily_brief_generated", requested_raw_units=1)
+
+        # Also check legacy daily quota for backward compatibility
         check_quota(db, context.tenant_id, today, "daily_brief_generated", requested_units=1)
 
         # Create the brief using the same generator as /v1/briefs/materialize
@@ -1057,18 +1133,18 @@ def run_daily_brief_job(
         )
         db.add(audit_log)
 
-        # Write usage event for brief creation
-        usage_event = UsageEvent(
+        # Emit usage via centralized metering
+        emit_usage(
+            db=db,
             tenant_id=context.tenant_id,
             user_id=context.user_id,
-            activity_type="daily_brief_generated",
-            units=1,
-            tool_name="daily_brief",
+            event_key="daily_brief_generated",
+            raw_units=1,
             request_id=brief_request_id,
+            tool_name="daily_brief",
         )
-        db.add(usage_event)
 
-        # Increment usage rollup for brief creation
+        # Increment legacy daily usage rollup for backward compatibility
         increment_usage(db, context.tenant_id, today, "daily_brief_generated", units=1)
 
         brief_created = True
@@ -1127,15 +1203,24 @@ def run_daily_brief_job(
 
     # Determine how many new notifications we can insert based on quota
     users_needing_notification = [uid for uid in users_to_notify if uid not in existing_user_ids]
-    remaining_quota = get_remaining_quota(db, context.tenant_id, today, "notification_enqueued")
-    remaining_quota = max(0, remaining_quota)  # Ensure non-negative
+
+    # Get billing remaining quota for notifications
+    billing_remaining = get_remaining_billing_quota(db, context.tenant_id, "notification_enqueued")
+    allowed_notifications = billing_remaining.get("allowed_raw_units", 0)
+
+    # Also check legacy daily quota
+    legacy_remaining_quota = get_remaining_quota(db, context.tenant_id, today, "notification_enqueued")
+    legacy_remaining_quota = max(0, legacy_remaining_quota)
+
+    # Use the minimum of both quotas
+    effective_remaining = min(allowed_notifications, legacy_remaining_quota)
 
     notifications_inserted = 0
     notifications_ignored = len(existing_user_ids)
     notifications_suppressed_due_to_quota = 0
 
     for user_id in users_needing_notification:
-        if remaining_quota <= 0:
+        if effective_remaining <= 0:
             # Quota exhausted, suppress remaining notifications
             notifications_suppressed_due_to_quota += 1
             continue
@@ -1151,20 +1236,20 @@ def run_daily_brief_job(
         )
         db.add(notif)
         notifications_inserted += 1
-        remaining_quota -= 1
+        effective_remaining -= 1
 
-        # Write usage event for each notification
-        usage_event = UsageEvent(
+        # Emit usage via centralized metering
+        emit_usage(
+            db=db,
             tenant_id=context.tenant_id,
             user_id=context.user_id,
-            activity_type="notification_enqueued",
-            units=1,
-            tool_name="daily_brief",
+            event_key="notification_enqueued",
+            raw_units=1,
             request_id=runner_request_id,
+            tool_name="daily_brief",
         )
-        db.add(usage_event)
 
-        # Increment usage rollup for each notification
+        # Increment legacy daily usage rollup
         increment_usage(db, context.tenant_id, today, "notification_enqueued", units=1)
 
     # Write a single audit log for the enqueue action
@@ -1558,7 +1643,13 @@ def cofounder_chat(
             detail=f"Role '{context.user.role}' is not authorized to use chat",
         )
 
-    # Check quota before making any state changes
+    # Check entitlement (capability)
+    check_entitlement(db, context.tenant_id, "chat")
+
+    # Check billing quota before making any state changes
+    check_billing_quota(db, context.tenant_id, "assistant_query", requested_raw_units=1)
+
+    # Also check legacy daily quota for backward compatibility
     today = get_today_date_utc()
     check_quota(db, context.tenant_id, today, "assistant_query", requested_units=1)
 
@@ -1635,18 +1726,18 @@ def cofounder_chat(
     )
     db.add(audit_log)
 
-    # Write usage event
-    usage_event = UsageEvent(
+    # Emit usage via centralized metering
+    emit_usage(
+        db=db,
         tenant_id=context.tenant_id,
         user_id=context.user_id,
-        activity_type="assistant_query",
-        units=1,
-        tool_name="chat",
+        event_key="assistant_query",
+        raw_units=1,
         request_id=request_id,
+        tool_name="chat",
     )
-    db.add(usage_event)
 
-    # Increment usage rollup
+    # Increment legacy daily usage rollup for backward compatibility
     increment_usage(db, context.tenant_id, today, "assistant_query", units=1)
 
     db.commit()

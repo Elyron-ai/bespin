@@ -210,6 +210,13 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
                 <button onclick="loadUsage()" style="margin-top: 8px;">Refresh Usage</button>
             </div>
             <div class="sidebar-section">
+                <h3>Billing / Credits</h3>
+                <div id="billing-panel" style="font-size: 12px; line-height: 1.6;">
+                    <div class="empty-state" style="font-size: 11px; padding: 10px 0;">Configure credentials above</div>
+                </div>
+                <button onclick="loadBillingUsage()" style="margin-top: 8px;">Refresh Billing</button>
+            </div>
+            <div class="sidebar-section">
                 <h3>Conversations</h3>
                 <button onclick="loadConversations()">Refresh</button>
             </div>
@@ -259,6 +266,7 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
             if (tenantId && apiKey && userId) {
                 loadConversations();
                 loadUsage();
+                loadBillingUsage();
             }
         });
 
@@ -298,6 +306,7 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
             setStatus('config-status', 'Saved! Loading...', 'success');
             loadConversations();
             loadUsage();
+            loadBillingUsage();
         }
 
         async function loadConversations() {
@@ -378,6 +387,79 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
                 usagePanel.innerHTML = html || '<div>No usage data</div>';
             } catch (e) {
                 usagePanel.innerHTML = '<div style="color: #cc0000; font-size: 11px;">Network error</div>';
+            }
+        }
+
+        async function loadBillingUsage() {
+            const billingPanel = document.getElementById('billing-panel');
+            try {
+                const response = await fetch('/v1/billing/usage', { headers: getHeaders() });
+                if (!response.ok) {
+                    billingPanel.innerHTML = '<div style="color: #cc0000; font-size: 11px;">Error loading billing</div>';
+                    return;
+                }
+
+                const data = await response.json();
+                const credits = data.credits;
+
+                // Calculate usage percentage
+                const pct = credits.included > 0 ? (credits.used / credits.included) * 100 : 0;
+                let creditsColor = '#333';
+                let creditsWarning = '';
+                if (pct >= 100) {
+                    creditsColor = '#cc0000';
+                    creditsWarning = ' (OVER)';
+                } else if (pct >= 80) {
+                    creditsColor = '#cc6600';
+                    creditsWarning = ' (!)';
+                }
+
+                let html = `
+                    <div style="margin-bottom: 8px;">
+                        <strong>Plan:</strong> ${data.plan.name}
+                    </div>
+                    <div style="color: ${creditsColor}; font-weight: 600;">
+                        Credits: ${credits.used.toFixed(1)} / ${credits.included}${creditsWarning}
+                    </div>
+                    <div style="color: #666; font-size: 11px;">
+                        Remaining: ${credits.remaining.toFixed(1)}
+                    </div>
+                `;
+
+                if (credits.overage_credits > 0) {
+                    html += `<div style="color: #cc0000; font-size: 11px;">
+                        Overage: ${credits.overage_credits.toFixed(1)} (~$${credits.estimated_overage_cost.toFixed(2)})
+                    </div>`;
+                }
+
+                html += `<div style="color: #666; font-size: 11px; margin-top: 4px;">
+                    Est. List Cost: $${credits.estimated_list_cost.toFixed(4)}
+                </div>`;
+
+                // Breakdown table
+                if (data.breakdown && data.breakdown.length > 0) {
+                    html += `<div style="margin-top: 10px; font-size: 11px;">
+                        <strong>Breakdown:</strong>
+                        <table style="width: 100%; margin-top: 4px; border-collapse: collapse; font-size: 10px;">
+                            <tr style="background: #f0f0f0;">
+                                <th style="text-align: left; padding: 2px 4px;">Event</th>
+                                <th style="text-align: right; padding: 2px 4px;">Units</th>
+                                <th style="text-align: right; padding: 2px 4px;">Credits</th>
+                            </tr>
+                    `;
+                    for (const item of data.breakdown) {
+                        html += `<tr>
+                            <td style="padding: 2px 4px;">${item.event_key.replace('_', ' ')}</td>
+                            <td style="text-align: right; padding: 2px 4px;">${item.raw_units}</td>
+                            <td style="text-align: right; padding: 2px 4px;">${item.credits.toFixed(1)}</td>
+                        </tr>`;
+                    }
+                    html += '</table></div>';
+                }
+
+                billingPanel.innerHTML = html;
+            } catch (e) {
+                billingPanel.innerHTML = '<div style="color: #cc0000; font-size: 11px;">Network error</div>';
             }
         }
 
@@ -484,6 +566,10 @@ PLAYGROUND_HTML = """<!DOCTYPE html>
 
                 // Reload conversation to show all messages
                 await selectConversation(currentConversationId);
+
+                // Refresh usage panels
+                loadUsage();
+                loadBillingUsage();
 
                 input.value = '';
             } catch (e) {

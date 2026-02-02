@@ -309,3 +309,164 @@ class DailyUsageResponse(BaseModel):
     date: str
     limits: TenantLimitsResponse
     usage: list[UsageItem]
+
+
+# =============================================================================
+# Billing Schemas (Phase 0 Item #7)
+# =============================================================================
+
+# Metered Event Type schemas
+class MeteredEventTypeCreate(BaseModel):
+    """Request schema for creating/updating a metered event type."""
+    event_key: str = Field(..., min_length=1, max_length=100)
+    display_name: str = Field(..., min_length=1, max_length=255)
+    description: str | None = None
+    unit_name: str = Field(..., min_length=1, max_length=50)
+    credits_per_unit: float = Field(..., ge=0)
+    list_price_per_credit: float = Field(..., ge=0)
+    billable: bool = True
+    active: bool = True
+
+
+class MeteredEventTypeUpdate(BaseModel):
+    """Request schema for updating a metered event type."""
+    display_name: str | None = Field(None, min_length=1, max_length=255)
+    description: str | None = None
+    unit_name: str | None = Field(None, min_length=1, max_length=50)
+    credits_per_unit: float | None = Field(None, ge=0)
+    list_price_per_credit: float | None = Field(None, ge=0)
+    billable: bool | None = None
+    active: bool | None = None
+
+
+class MeteredEventTypeResponse(BaseModel):
+    """Response schema for a metered event type."""
+    event_key: str
+    display_name: str
+    description: str | None
+    unit_name: str
+    credits_per_unit: float
+    list_price_per_credit: float
+    billable: bool
+    active: bool
+    created_at: str
+    updated_at: str
+
+
+# Plan schemas
+class PlanCreate(BaseModel):
+    """Request schema for creating a plan."""
+    plan_id: str = Field(..., min_length=1, max_length=100)
+    name: str = Field(..., min_length=1, max_length=255)
+    included_credits: int = Field(..., ge=0)
+    overage_price_per_credit: float = Field(..., ge=0)
+
+
+class PlanUpdate(BaseModel):
+    """Request schema for updating a plan."""
+    name: str | None = Field(None, min_length=1, max_length=255)
+    included_credits: int | None = Field(None, ge=0)
+    overage_price_per_credit: float | None = Field(None, ge=0)
+
+
+class PlanResponse(BaseModel):
+    """Response schema for a plan."""
+    plan_id: str
+    name: str
+    included_credits: int
+    overage_price_per_credit: float
+    created_at: str
+    updated_at: str
+
+
+class PlanCapabilitiesUpdate(BaseModel):
+    """Request schema for updating plan capabilities."""
+    capabilities: list[str]
+
+
+class PlanEventCapItem(BaseModel):
+    """A single event cap item."""
+    event_key: str
+    period: str = "monthly"
+    cap_raw_units: float = Field(..., ge=0)
+
+
+class PlanEventCapsUpdate(BaseModel):
+    """Request schema for updating plan event caps."""
+    caps: list[PlanEventCapItem]
+
+
+# Tenant Subscription schemas
+class TenantSubscriptionUpdate(BaseModel):
+    """Request schema for updating tenant subscription."""
+    plan_id: str = Field(..., min_length=1, max_length=100)
+    status: str = Field("active", pattern="^(active|suspended)$")
+    period_start: str | None = Field(None, description="YYYY-MM-01, defaults to current month")
+
+
+class TenantSubscriptionResponse(BaseModel):
+    """Response schema for tenant subscription."""
+    tenant_id: str
+    plan_id: str
+    status: str
+    period_start: str
+    period_end: str
+    created_at: str
+    updated_at: str
+
+
+class TenantSubscriptionWithPlanResponse(BaseModel):
+    """Response schema for tenant subscription with plan details."""
+    tenant_id: str
+    plan_id: str
+    status: str
+    period_start: str
+    period_end: str
+    plan: PlanResponse
+    capabilities: list[str]
+
+
+# Billing Usage schemas
+class BillingUsageBreakdownItem(BaseModel):
+    """A single usage breakdown item in the billing usage response."""
+    event_key: str
+    unit_name: str
+    raw_units: float
+    credits: float
+    list_cost_estimate: float
+
+
+class BillingCreditsInfo(BaseModel):
+    """Credits information in the billing usage response."""
+    included: int
+    used: float
+    remaining: float
+    overage_credits: float
+    estimated_overage_cost: float
+    estimated_list_cost: float
+
+
+class BillingUsageResponse(BaseModel):
+    """Response schema for billing usage."""
+    period_start: str
+    period_end: str
+    plan: PlanResponse
+    credits: BillingCreditsInfo
+    breakdown: list[BillingUsageBreakdownItem]
+
+
+class BillingLedgerItem(BaseModel):
+    """A single ledger item in the billing ledger response."""
+    event_key: str
+    raw_units: float
+    credits: float
+    list_cost_estimate: float
+    tool_name: str | None
+    request_id: str
+    created_at: str
+
+
+class BillingLedgerResponse(BaseModel):
+    """Response schema for billing ledger."""
+    period_start: str
+    items: list[BillingLedgerItem]

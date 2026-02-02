@@ -21,6 +21,14 @@ from app.gateway.models import (
     NotificationOutbox,
     NotificationPref,
     UsageEvent,
+    # Billing models
+    MeteredEventType,
+    Plan,
+    PlanCapability,
+    PlanEventCap,
+    Capability,
+    TenantSubscription,
+    UsageRollupPeriod,
 )
 
 router = APIRouter(prefix="/console", tags=["console"])
@@ -43,6 +51,14 @@ ALLOWED_TABLES = {
     "notification_outbox": NotificationOutbox,
     "conversations": Conversation,
     "messages": Message,
+    # Billing tables
+    "metered_event_types": MeteredEventType,
+    "plans": Plan,
+    "plan_capabilities": PlanCapability,
+    "plan_event_caps": PlanEventCap,
+    "capabilities": Capability,
+    "tenant_subscriptions": TenantSubscription,
+    "usage_rollups_period": UsageRollupPeriod,
 }
 
 
@@ -86,6 +102,7 @@ def html_page(title: str, content: str) -> str:
     <div class="nav">
         <a href="/console?key={DEV_CONSOLE_KEY}">Overview</a>
         <a href="/console/tenants?key={DEV_CONSOLE_KEY}">Tenants</a>
+        <a href="/console/billing?key={DEV_CONSOLE_KEY}">Billing</a>
         <a href="/console/db/tenants?key={DEV_CONSOLE_KEY}">Tables</a>
         <a href="/console/db/download?key={DEV_CONSOLE_KEY}">Download DB</a>
     </div>
@@ -123,6 +140,10 @@ def console_overview(
         "Notification Outbox": db.query(func.count(NotificationOutbox.id)).scalar() or 0,
         "Conversations": db.query(func.count(Conversation.conversation_id)).scalar() or 0,
         "Messages": db.query(func.count(Message.message_id)).scalar() or 0,
+        # Billing counts
+        "Metered Events": db.query(func.count(MeteredEventType.event_key)).scalar() or 0,
+        "Plans": db.query(func.count(Plan.plan_id)).scalar() or 0,
+        "Subscriptions": db.query(func.count(TenantSubscription.tenant_id)).scalar() or 0,
     }
 
     stats_html = ""
@@ -227,6 +248,42 @@ def console_tenant_detail(
         outbox_html += f"<tr><td>{o.id}</td><td>{o.user_id}</td><td>{o.notification_type}</td><td>{o.notif_date}</td><td>{o.status}</td></tr>"
     outbox_html += "</table>"
 
+    # Subscription
+    subscription = db.query(TenantSubscription).filter(
+        TenantSubscription.tenant_id == tenant_id
+    ).first()
+
+    if subscription:
+        sub_plan = db.query(Plan).filter(Plan.plan_id == subscription.plan_id).first()
+        sub_html = f"""
+        <div class="card">
+            <h2>Subscription</h2>
+            <p><strong>Plan:</strong> <a href="/console/billing/plans/{subscription.plan_id}?key={DEV_CONSOLE_KEY}">{subscription.plan_id}</a> ({sub_plan.name if sub_plan else 'Unknown'})</p>
+            <p><strong>Status:</strong> {subscription.status}</p>
+            <p><strong>Period:</strong> {subscription.period_start} to {subscription.period_end}</p>
+            <p><strong>Included Credits:</strong> {sub_plan.included_credits if sub_plan else 'N/A'}</p>
+        </div>
+        """
+    else:
+        sub_html = """<div class="card"><h2>Subscription</h2><p>No subscription found.</p></div>"""
+
+    # Usage rollups for this tenant
+    rollups = db.query(UsageRollupPeriod).filter(
+        UsageRollupPeriod.tenant_id == tenant_id
+    ).order_by(UsageRollupPeriod.period_start.desc()).limit(20).all()
+
+    rollups_html = """<table>
+        <tr><th>Period Start</th><th>Event Key</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>"""
+    for r in rollups:
+        rollups_html += f"""<tr>
+            <td>{r.period_start}</td>
+            <td>{r.event_key}</td>
+            <td>{r.raw_units:.2f}</td>
+            <td>{r.credits:.2f}</td>
+            <td>${r.list_cost_estimate:.4f}</td>
+        </tr>"""
+    rollups_html += "</table>"
+
     content = f"""
     <div class="card">
         <h2>Tenant Info</h2>
@@ -236,6 +293,11 @@ def console_tenant_detail(
         <p><strong>API Key:</strong> <code>{tenant.api_key}</code></p>
         <p><strong>Created:</strong> {tenant.created_at}</p>
     </div>
+
+    {sub_html}
+
+    <h2>Usage Rollups ({len(rollups)})</h2>
+    {rollups_html}
 
     <h2>Users ({len(users)})</h2>
     {users_html}
@@ -251,6 +313,147 @@ def console_tenant_detail(
     """
 
     return html_page(f"Tenant: {tenant.name}", content)
+
+
+@router.get("/billing", response_class=HTMLResponse)
+def console_billing(
+    _: bool = Depends(verify_console_access),
+    db: Session = Depends(get_db),
+) -> str:
+    """Billing overview: metered events, plans, subscriptions."""
+    # Metered event types
+    events = db.query(MeteredEventType).order_by(MeteredEventType.event_key).all()
+    events_html = """<table>
+        <tr><th>Event Key</th><th>Display Name</th><th>Unit</th><th>Credits/Unit</th><th>Price/Credit</th><th>Billable</th><th>Active</th></tr>"""
+    for e in events:
+        events_html += f"""<tr>
+            <td>{e.event_key}</td>
+            <td>{e.display_name}</td>
+            <td>{e.unit_name}</td>
+            <td>{e.credits_per_unit}</td>
+            <td>${e.list_price_per_credit}</td>
+            <td>{'Yes' if e.billable else 'No'}</td>
+            <td>{'Yes' if e.active else 'No'}</td>
+        </tr>"""
+    events_html += "</table>"
+
+    # Plans
+    plans = db.query(Plan).order_by(Plan.plan_id).all()
+    plans_html = """<table>
+        <tr><th>Plan ID</th><th>Name</th><th>Included Credits</th><th>Overage Price</th></tr>"""
+    for p in plans:
+        plans_html += f"""<tr>
+            <td><a href="/console/billing/plans/{p.plan_id}?key={DEV_CONSOLE_KEY}">{p.plan_id}</a></td>
+            <td>{p.name}</td>
+            <td>{p.included_credits}</td>
+            <td>${p.overage_price_per_credit}</td>
+        </tr>"""
+    plans_html += "</table>"
+
+    # Subscriptions
+    subscriptions = db.query(TenantSubscription).all()
+    subs_html = """<table>
+        <tr><th>Tenant ID</th><th>Plan</th><th>Status</th><th>Period Start</th><th>Period End</th></tr>"""
+    for s in subscriptions:
+        subs_html += f"""<tr>
+            <td><a href="/console/tenants/{s.tenant_id}?key={DEV_CONSOLE_KEY}">{s.tenant_id[:8]}...</a></td>
+            <td>{s.plan_id}</td>
+            <td>{s.status}</td>
+            <td>{s.period_start}</td>
+            <td>{s.period_end}</td>
+        </tr>"""
+    subs_html += "</table>"
+
+    # Usage rollups
+    rollups = db.query(UsageRollupPeriod).order_by(
+        UsageRollupPeriod.tenant_id,
+        UsageRollupPeriod.period_start.desc()
+    ).limit(50).all()
+    rollups_html = """<table>
+        <tr><th>Tenant ID</th><th>Period Start</th><th>Event Key</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>"""
+    for r in rollups:
+        rollups_html += f"""<tr>
+            <td>{r.tenant_id[:8]}...</td>
+            <td>{r.period_start}</td>
+            <td>{r.event_key}</td>
+            <td>{r.raw_units:.2f}</td>
+            <td>{r.credits:.2f}</td>
+            <td>${r.list_cost_estimate:.4f}</td>
+        </tr>"""
+    rollups_html += "</table>"
+
+    content = f"""
+    <div class="card">
+        <h2>Metered Event Types ({len(events)})</h2>
+        {events_html}
+    </div>
+
+    <div class="card">
+        <h2>Plans ({len(plans)})</h2>
+        {plans_html}
+    </div>
+
+    <div class="card">
+        <h2>Tenant Subscriptions ({len(subscriptions)})</h2>
+        {subs_html}
+    </div>
+
+    <div class="card">
+        <h2>Usage Rollups (Recent 50)</h2>
+        {rollups_html}
+    </div>
+    """
+
+    return html_page("Billing Overview", content)
+
+
+@router.get("/billing/plans/{plan_id}", response_class=HTMLResponse)
+def console_plan_detail(
+    plan_id: str,
+    _: bool = Depends(verify_console_access),
+    db: Session = Depends(get_db),
+) -> str:
+    """Plan detail: capabilities and event caps."""
+    plan = db.query(Plan).filter(Plan.plan_id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Plan not found")
+
+    # Capabilities
+    caps = db.query(PlanCapability).filter(PlanCapability.plan_id == plan_id).all()
+    caps_html = "<ul>"
+    for c in caps:
+        caps_html += f"<li>{c.capability_key}</li>"
+    caps_html += "</ul>" if caps else "<p>No capabilities assigned.</p>"
+
+    # Event caps
+    event_caps = db.query(PlanEventCap).filter(PlanEventCap.plan_id == plan_id).all()
+    event_caps_html = """<table>
+        <tr><th>Event Key</th><th>Period</th><th>Cap (Raw Units)</th></tr>"""
+    for ec in event_caps:
+        event_caps_html += f"""<tr>
+            <td>{ec.event_key}</td>
+            <td>{ec.period}</td>
+            <td>{ec.cap_raw_units}</td>
+        </tr>"""
+    event_caps_html += "</table>" if event_caps else "<p>No event caps.</p>"
+
+    content = f"""
+    <div class="card">
+        <h2>Plan Info</h2>
+        <p><strong>ID:</strong> {plan.plan_id}</p>
+        <p><strong>Name:</strong> {plan.name}</p>
+        <p><strong>Included Credits:</strong> {plan.included_credits}</p>
+        <p><strong>Overage Price:</strong> ${plan.overage_price_per_credit}/credit</p>
+    </div>
+
+    <h2>Capabilities ({len(caps)})</h2>
+    {caps_html}
+
+    <h2>Event Caps ({len(event_caps)})</h2>
+    {event_caps_html}
+    """
+
+    return html_page(f"Plan: {plan.name}", content)
 
 
 @router.get("/db/{table}", response_class=HTMLResponse)
