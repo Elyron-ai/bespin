@@ -129,6 +129,32 @@ def member_a_headers(tenant_a, member_a):
     }
 
 
+@pytest.fixture
+def member_a2(client, tenant_a, admin_a_headers):
+    """Create a second member user for tenant A."""
+    response = client.post(
+        "/v1/users",
+        json={
+            "tenant_id": tenant_a["tenant_id"],
+            "email": "member-a2@test.com",
+            "role": "member",
+        },
+        headers=admin_a_headers,
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
+@pytest.fixture
+def member_a2_headers(tenant_a, member_a2):
+    """Get headers for tenant A second member user."""
+    return {
+        "X-Tenant-ID": tenant_a["tenant_id"],
+        "X-User-ID": member_a2["user_id"],
+        "X-API-Key": tenant_a["api_key"],
+    }
+
+
 # =============================================================================
 # Tenant Isolation Tests
 # =============================================================================
@@ -704,3 +730,555 @@ class TestFullWorkflows:
         base_price_facts = [f for f in facts if f["fact_key"] == "base.price"]
         assert len(base_price_facts) == 1
         assert base_price_facts[0]["fact_value"] == "$150/month"
+
+
+# =============================================================================
+# Actions v0 Tests (Phase 1, Task 8a)
+# =============================================================================
+
+class TestActionsV0Create:
+    """Test action creation (Phase 1 Task 8a)."""
+
+    def test_member_creates_action(self, client, member_a_headers):
+        """Member can create an action. Status defaults to proposed."""
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Test Action", "action_type": "general", "payload": {"key": "value"}},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        action = response.json()
+        assert action["status"] == "proposed"
+        assert "action_id" in action
+        assert action["title"] == "Test Action"
+        assert action["action_type"] == "general"
+        assert action["payload"] == {"key": "value"}
+
+    def test_action_with_source_options(self, client, admin_a_headers):
+        """Action can specify source (user, agent, system)."""
+        for source in ["user", "agent", "system"]:
+            response = client.post(
+                "/v1/actions",
+                json={
+                    "title": f"Action from {source}",
+                    "action_type": "general",
+                    "source": source,
+                    "source_ref": f"ref-{source}",
+                },
+                headers=admin_a_headers,
+            )
+            assert response.status_code == 201
+            assert response.json()["source"] == source
+            assert response.json()["source_ref"] == f"ref-{source}"
+
+
+class TestActionsV0TenantIsolation:
+    """Test tenant isolation for actions (Phase 1 Task 8a)."""
+
+    def test_cross_tenant_access_returns_404(self, client, admin_a_headers, admin_b_headers):
+        """Accessing another tenant's action returns 404 (not 403)."""
+        # Create action in tenant A
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Secret", "action_type": "confidential"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+        action_id = response.json()["action_id"]
+
+        # Tenant B tries to GET the action
+        response = client.get(f"/v1/actions/{action_id}", headers=admin_b_headers)
+        assert response.status_code == 404
+
+    def test_cross_tenant_cancel_returns_404(self, client, admin_a_headers, admin_b_headers):
+        """Attempting to cancel another tenant's action returns 404."""
+        # Create action in tenant A
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Tenant B tries to cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_b_headers,
+        )
+        assert response.status_code == 404
+
+    def test_cross_tenant_list_is_empty(self, client, admin_a_headers, admin_b_headers):
+        """Listing actions from another tenant shows nothing."""
+        # Create action in tenant A
+        client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Only", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # Tenant B lists actions
+        response = client.get("/v1/actions?status=all", headers=admin_b_headers)
+        assert response.status_code == 200
+        assert response.json()["total"] == 0
+
+
+class TestActionsV0ListFilters:
+    """Test action listing with filters (Phase 1 Task 8a)."""
+
+    def test_list_status_filter_proposed(self, client, admin_a_headers):
+        """Default status filter is 'proposed'."""
+        # Create an action
+        client.post(
+            "/v1/actions",
+            json={"title": "Proposed Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # List with default (proposed)
+        response = client.get("/v1/actions", headers=admin_a_headers)
+        assert response.status_code == 200
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert all(a["status"] == "proposed" for a in items)
+
+    def test_list_status_filter_cancelled(self, client, admin_a_headers):
+        """Can filter by status=cancelled."""
+        # Create and cancel an action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Cancel", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/cancel", json={}, headers=admin_a_headers)
+
+        # Create another that stays proposed
+        client.post(
+            "/v1/actions",
+            json={"title": "Stay Proposed", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # List cancelled only
+        response = client.get("/v1/actions?status=cancelled", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["title"] == "To Cancel"
+        assert items[0]["status"] == "cancelled"
+
+    def test_list_status_filter_all(self, client, admin_a_headers):
+        """Can list all actions with status=all."""
+        # Create two actions
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Action 1", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        client.post(
+            "/v1/actions",
+            json={"title": "Action 2", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # Cancel the first
+        client.post(f"/v1/actions/{action_id}/cancel", json={}, headers=admin_a_headers)
+
+        # List all
+        response = client.get("/v1/actions?status=all", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) == 2
+
+    def test_list_created_by_filter(self, client, admin_a_headers, member_a_headers, member_a):
+        """Can filter by created_by_user_id."""
+        # Admin creates an action
+        client.post(
+            "/v1/actions",
+            json={"title": "Admin Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # Member creates an action
+        client.post(
+            "/v1/actions",
+            json={"title": "Member Action", "action_type": "general"},
+            headers=member_a_headers,
+        )
+
+        # Filter by member's ID
+        response = client.get(
+            f"/v1/actions?status=all&created_by_user_id={member_a['user_id']}",
+            headers=admin_a_headers,
+        )
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["title"] == "Member Action"
+
+    def test_list_assigned_to_filter(self, client, admin_a_headers, member_a):
+        """Can filter by assigned_to_user_id."""
+        # Create unassigned action
+        client.post(
+            "/v1/actions",
+            json={"title": "Unassigned", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # Create assigned action
+        client.post(
+            "/v1/actions",
+            json={
+                "title": "Assigned to Member",
+                "action_type": "general",
+                "assigned_to_user_id": member_a["user_id"],
+            },
+            headers=admin_a_headers,
+        )
+
+        # Filter by assignee
+        response = client.get(
+            f"/v1/actions?status=all&assigned_to_user_id={member_a['user_id']}",
+            headers=admin_a_headers,
+        )
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["title"] == "Assigned to Member"
+
+
+class TestActionsV0CancelRBAC:
+    """Test cancel RBAC rules (Phase 1 Task 8a)."""
+
+    def test_member_can_cancel_own_proposed_action(self, client, member_a_headers):
+        """Member can cancel their own proposed action."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "My Action", "action_type": "general"},
+            headers=member_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Cancel it
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={"comment": "Changed my mind"},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+    def test_member_cannot_cancel_others_action(self, client, admin_a_headers, member_a_headers):
+        """Member cannot cancel someone else's action (403)."""
+        # Admin creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Admin's Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Member tries to cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 403
+        assert "Not authorized" in response.json()["detail"]
+
+    def test_member_cannot_cancel_other_members_action(
+        self, client, member_a_headers, member_a2_headers
+    ):
+        """One member cannot cancel another member's action (403)."""
+        # First member creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Member 1's Action", "action_type": "general"},
+            headers=member_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Second member tries to cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=member_a2_headers,
+        )
+        assert response.status_code == 403
+
+    def test_admin_can_cancel_any_proposed_action(self, client, admin_a_headers, member_a_headers):
+        """Admin can cancel any proposed action in the tenant."""
+        # Member creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Member's Action", "action_type": "general"},
+            headers=member_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Admin cancels it
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+    def test_cannot_cancel_non_proposed_action(self, client, admin_a_headers):
+        """Cannot cancel an action that is not in proposed status."""
+        # Create and approve action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Approved Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Try to cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 400
+        assert "proposed" in response.json()["detail"].lower()
+
+
+class TestActionsV0Metering:
+    """Test metering for action operations (Phase 1 Task 8a)."""
+
+    def test_action_created_metered(self, client, admin_a_headers):
+        """Creating an action emits action_created usage."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Metered Create", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+
+        # Check usage
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        action_created = next((b for b in breakdown if b["event_key"] == "action_created"), None)
+        assert action_created is not None
+        assert action_created["raw_units"] >= 1
+        assert action_created["credits"] == action_created["raw_units"] * 0.2
+
+    def test_action_cancel_metered_as_updated(self, client, admin_a_headers):
+        """Cancelling an action emits action_updated usage."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Cancel", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Get baseline usage
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        updated_before = next(
+            (b for b in breakdown if b["event_key"] == "action_updated"),
+            {"raw_units": 0, "credits": 0}
+        )
+
+        # Cancel action
+        client.post(f"/v1/actions/{action_id}/cancel", json={}, headers=admin_a_headers)
+
+        # Check usage increased
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        updated_after = next((b for b in breakdown if b["event_key"] == "action_updated"), None)
+        assert updated_after is not None
+        assert updated_after["raw_units"] == updated_before["raw_units"] + 1
+
+
+class TestActionsV0QuotaEnforcement:
+    """Test quota enforcement for actions (Phase 1 Task 8a)."""
+
+    def test_quota_exceeded_returns_429(self, client, tenant_a, admin_a_headers):
+        """When quota exceeded, returns 429 and no row created."""
+        # Set up a plan with cap of 1 action_created per month
+        # Use platform admin to add an event cap
+        platform_headers = {"X-Platform-Admin-Key": "test-admin-key"}
+
+        # Create a test plan with a cap
+        response = client.post(
+            "/v1/admin/plans",
+            json={
+                "plan_id": "test_action_limited",
+                "name": "Action Limited",
+                "included_credits": 1000,
+                "overage_price_per_credit": 0.02,
+            },
+            headers=platform_headers,
+        )
+        # May already exist, that's fine
+        assert response.status_code in [200, 201, 409]
+
+        # Add all capabilities (required for action_center access)
+        client.put(
+            "/v1/admin/plans/test_action_limited/capabilities",
+            json={"capabilities": ["action_center"]},
+            headers=platform_headers,
+        )
+
+        # Add event cap of 1 for action_created
+        client.put(
+            "/v1/admin/plans/test_action_limited/caps",
+            json={
+                "caps": [
+                    {"event_key": "action_created", "period": "monthly", "cap_raw_units": 1}
+                ]
+            },
+            headers=platform_headers,
+        )
+
+        # Assign the limited plan to the tenant
+        client.put(
+            f"/v1/admin/tenants/{tenant_a['tenant_id']}/subscription",
+            json={"plan_id": "test_action_limited", "status": "active"},
+            headers=platform_headers,
+        )
+
+        # First action should succeed
+        response = client.post(
+            "/v1/actions",
+            json={"title": "First Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+
+        # Second action should fail with 429
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Second Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 429
+        # Response can be structured dict or string - just verify it contains quota-related info
+        detail = response.json().get("detail", "")
+        if isinstance(detail, dict):
+            # Structured quota error response
+            assert "event_key" in detail or "cap" in detail or "limit" in detail
+        else:
+            assert "quota" in str(detail).lower() or "exceeded" in str(detail).lower()
+
+        # Verify only one action exists
+        response = client.get("/v1/actions?status=all", headers=admin_a_headers)
+        assert response.json()["total"] == 1
+
+    def test_quota_failure_does_not_emit_usage(self, client, tenant_a, admin_a_headers):
+        """When quota fails, no usage is emitted."""
+        platform_headers = {"X-Platform-Admin-Key": "test-admin-key"}
+
+        # Create a plan with cap of 0 for action_created (immediate failure)
+        response = client.post(
+            "/v1/admin/plans",
+            json={
+                "plan_id": "test_no_actions",
+                "name": "No Actions Plan",
+                "included_credits": 1000,
+                "overage_price_per_credit": 0.02,
+            },
+            headers=platform_headers,
+        )
+        assert response.status_code in [200, 201, 409]
+
+        # Add capabilities
+        client.put(
+            "/v1/admin/plans/test_no_actions/capabilities",
+            json={"capabilities": ["action_center"]},
+            headers=platform_headers,
+        )
+
+        # Add event cap of 0
+        client.put(
+            "/v1/admin/plans/test_no_actions/caps",
+            json={
+                "caps": [
+                    {"event_key": "action_created", "period": "monthly", "cap_raw_units": 0}
+                ]
+            },
+            headers=platform_headers,
+        )
+
+        # Assign plan
+        client.put(
+            f"/v1/admin/tenants/{tenant_a['tenant_id']}/subscription",
+            json={"plan_id": "test_no_actions", "status": "active"},
+            headers=platform_headers,
+        )
+
+        # Get baseline usage
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        usage_before = sum(b.get("raw_units", 0) for b in response.json()["breakdown"])
+
+        # Try to create action (should fail)
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Should Fail", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 429
+
+        # Usage should not have increased for action_created
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        action_created = next(
+            (b for b in response.json()["breakdown"] if b["event_key"] == "action_created"),
+            None
+        )
+        assert action_created is None or action_created["raw_units"] == 0
+
+
+class TestActionsV0CancelIdempotency:
+    """Test cancel idempotency (Phase 1 Task 8a)."""
+
+    def test_cancel_idempotent(self, client, admin_a_headers):
+        """Cancelling an already cancelled action returns 200 without emitting usage."""
+        # Create action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Cancel Twice", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # First cancel
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+        # Get usage after first cancel
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        updated_after_first = next(
+            (b for b in breakdown if b["event_key"] == "action_updated"),
+            {"raw_units": 0}
+        )
+
+        # Second cancel (idempotent)
+        response = client.post(
+            f"/v1/actions/{action_id}/cancel",
+            json={},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+        # Usage should NOT have incremented
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        updated_after_second = next(
+            (b for b in breakdown if b["event_key"] == "action_updated"),
+            {"raw_units": 0}
+        )
+        assert updated_after_second["raw_units"] == updated_after_first["raw_units"]

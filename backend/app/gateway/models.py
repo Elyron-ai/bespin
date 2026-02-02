@@ -347,6 +347,7 @@ class Action(Base):
 
     __table_args__ = (
         Index("ix_actions_tenant_status_created", "tenant_id", "status", "created_at"),
+        Index("ix_actions_tenant_creator_created", "tenant_id", "created_by_user_id", "created_at"),
         Index("ix_actions_tenant_assigned_status", "tenant_id", "assigned_to_user_id", "status"),
     )
 
