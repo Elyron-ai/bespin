@@ -92,6 +92,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 ./scripts/smoke_core_os_v0.sh                # Core Business OS smoke test
 ./scripts/smoke_phase1_task8a_actions_v0.sh  # Actions v0 smoke test
 ./scripts/smoke_phase1_task8b_action_approvals.sh  # Action Approvals smoke test
+./scripts/smoke_phase1_task8c_action_execute.sh   # Action Execute smoke test
 ```
 
 ## API Overview
@@ -135,6 +136,7 @@ poetry run pytest tests/test_tools_invoke.py -v
 | `PUT /v1/admin/tenants/{tenant_id}/subscription` | Update tenant subscription (platform admin) |
 | `GET /ui` | Playground UI (requires PLAYGROUND_UI_ENABLED=1) |
 | `GET /app` | Core Business OS UI (requires PLAYGROUND_UI_ENABLED=1) |
+| `GET /v1/me` | Get current user info (role, email) for UI |
 | **Core Business OS - Actions** | |
 | `POST /v1/actions` | Create action (proposed state) |
 | `GET /v1/actions` | List actions (filters: status, created_by_user_id, assigned_to_user_id) |
@@ -388,7 +390,7 @@ export PLATFORM_ADMIN_KEY=your-admin-key
 | `action_created` | record | 0.2 | $0.02 | Action created |
 | `action_approved` | event | 0.2 | $0.02 | Action approved |
 | `action_rejected` | event | 0.1 | $0.02 | Action rejected |
-| `action_executed` | event | 0.5 | $0.02 | Action executed |
+| `action_executed` | event | 0.3 | $0.02 | Action executed |
 | `task_created` | record | 0.1 | $0.02 | Task created |
 | `task_updated` | record | 0.05 | $0.02 | Task updated |
 | `task_completed` | record | 0.1 | $0.02 | Task completed |
@@ -529,13 +531,20 @@ New capabilities added to plans:
 Access the Core Business OS UI at `http://localhost:8000/app` (requires `PLAYGROUND_UI_ENABLED=1`).
 
 Features:
-- **Actions**: Create, view, approve/reject, execute actions
+- **Actions**: Create, view, approve/reject/cancel, execute actions with full workflow
 - **Tasks**: Create, assign, track, complete tasks
 - **Decisions**: Log strategic decisions (admin only)
 - **Meetings**: Document meeting notes
 - **Memory**: Curate business facts (ICP, goals, pricing)
 - **Search**: Global search across all entities
 - **Timeline**: View recent activity stream
+- **Billing**: View credits used, remaining, and breakdown by event type
+
+UI Features for Action Center:
+- Status filter dropdown (all/proposed/approved/rejected/executed/cancelled)
+- Action detail view showing review and execution data
+- Role-aware buttons (admin sees approve/reject/execute, member sees cancel)
+- `/v1/me` endpoint for detecting current user role
 
 ### Running the Core OS Smoke Test
 
@@ -639,6 +648,92 @@ Actions can have the following statuses:
 - **Admin only**: Only admins can approve or reject actions
 - **Member**: Cannot approve or reject (returns 403)
 - **Cross-tenant**: Accessing another tenant's action returns 404 (not 403)
+
+### Running the Action Execute Smoke Test (Phase 1 Task 8c)
+
+```bash
+# Server must be running
+./scripts/smoke_phase1_task8c_action_execute.sh
+```
+
+The Action Execute smoke test demonstrates:
+1. Creating a tenant with admin and member users
+2. Testing `/v1/me` endpoint for role detection
+3. Member creates a proposed action
+4. Admin approves action
+5. Admin executes action with result payload
+6. Fetching action detail showing review + execution info
+7. Verifying idempotent execute (second call returns original data)
+8. Verifying status transition enforcement (proposed -> execute = 409)
+9. Verifying RBAC (member cannot execute = 403)
+10. Fetching timeline showing action_executed event
+11. Verifying billing usage for action_executed
+
+### Action Execution Log (v0)
+
+- Each action can have at most **one execution** (enforced at database level)
+- Only **approved** actions can be executed (returns 409 for other statuses)
+- Execution creates an execution record in the `action_executions` table with:
+  - `execution_id`: UUID for the execution
+  - `executed_by_user_id`: The admin who executed the action
+  - `execution_status`: "succeeded" | "failed" | "skipped"
+  - `result`: JSON payload with execution results
+  - `created_at`: Timestamp of execution
+- Execution creates a `action_executed` timeline event
+- Execution is metered via `action_executed` event (0.3 credits/unit)
+
+### Idempotent Execute Behavior
+
+- **Executing an already executed action**: Returns 200 with current action + execution state, no additional writes
+- **No duplicate writes**: No new execution record, no new timeline event, no new usage event
+- **Original data preserved**: Second call returns original execution data, not the new values passed in
+
+### Execute Status Transitions
+
+| From Status | Execute Action | Result |
+|-------------|----------------|--------|
+| `proposed` | Execute | 409 Conflict (invalid_status_transition) |
+| `approved` | Execute | 200 OK (action becomes executed) |
+| `rejected` | Execute | 409 Conflict (invalid_status_transition) |
+| `cancelled` | Execute | 409 Conflict (invalid_status_transition) |
+| `executed` | Execute | 200 OK (idempotent, no writes) |
+
+### Actions Execute RBAC Rules
+
+- **Admin only**: Only admins can execute actions
+- **Member**: Cannot execute (returns 403)
+- **Cross-tenant**: Accessing another tenant's action returns 404 (not 403)
+
+### Action Detail Response
+
+GET `/v1/actions/{action_id}` now includes optional review and execution data:
+
+```json
+{
+  "action_id": "...",
+  "status": "executed",
+  "title": "...",
+  "review": {
+    "decision": "approved",
+    "reviewer_user_id": "...",
+    "comment": "Approved for Q1",
+    "created_at": "..."
+  },
+  "execution": {
+    "execution_id": "...",
+    "executed_by_user_id": "...",
+    "execution_status": "succeeded",
+    "result": {"key": "value"},
+    "created_at": "..."
+  }
+}
+```
+
+### Execute v0 Metered Events
+
+| Event Key | Unit | Credits/Unit | Description |
+|-----------|------|--------------|-------------|
+| `action_executed` | event | 0.3 | Action executed by admin |
 
 ### Example: Action Workflow
 
@@ -803,5 +898,8 @@ bespin/
     ├── smoke_phase0_item5.sh    # Cofounder Chat smoke test
     ├── smoke_phase0_item6.sh    # Quota Enforcement smoke test
     ├── smoke_phase0_item7.sh    # Billing + Metering smoke test
-    └── smoke_core_os_v0.sh      # Core Business OS smoke test
+    ├── smoke_core_os_v0.sh      # Core Business OS smoke test
+    ├── smoke_phase1_task8a_actions_v0.sh     # Actions v0 smoke test
+    ├── smoke_phase1_task8b_action_approvals.sh  # Action Approvals smoke test
+    └── smoke_phase1_task8c_action_execute.sh    # Action Execute smoke test
 ```

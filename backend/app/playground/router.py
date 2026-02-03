@@ -809,6 +809,7 @@ CORE_OS_HTML = """<!DOCTYPE html>
             <a href="#" data-section="memory">Memory</a>
             <hr>
             <a href="#" data-section="timeline">Timeline</a>
+            <a href="#" data-section="billing">Billing</a>
             <a href="#" data-section="search">Search</a>
         </div>
         <div class="content" id="content">
@@ -884,20 +885,20 @@ CORE_OS_HTML = """<!DOCTYPE html>
                 localStorage.setItem('playground_' + id.replace('-', '_'), document.getElementById(id).value);
             });
 
-            // Test connection and get user role
+            // Test connection and get user role via /v1/me endpoint
             try {
-                const res = await fetch('/v1/conversations', { headers: getHeaders() });
-                if (!res.ok) throw new Error('Auth failed');
+                const meRes = await fetch('/v1/me', { headers: getHeaders() });
+                if (!meRes.ok) throw new Error('Auth failed');
+                const meData = await meRes.json();
                 setStatus('Connected', 'success');
 
-                // Try to determine role from a test call
-                const actionsRes = await fetch('/v1/actions?limit=1', { headers: getHeaders() });
-                userRole = actionsRes.ok ? 'admin' : 'member';
-                document.getElementById('user-role').textContent = 'Role: ' + userRole;
+                // Set user role from /v1/me response
+                userRole = meData.role;
+                document.getElementById('user-role').textContent = 'Role: ' + userRole + ' | ' + meData.email;
 
                 loadSection(currentSection);
             } catch (e) {
-                setStatus('Connection failed', 'error');
+                setStatus('Connection failed: ' + e.message, 'error');
             }
         }
 
@@ -911,6 +912,7 @@ CORE_OS_HTML = """<!DOCTYPE html>
                 case 'meetings': loadMeetings(); break;
                 case 'memory': loadMemory(); break;
                 case 'timeline': loadTimeline(); break;
+                case 'billing': loadBilling(); break;
                 case 'search': loadSearch(); break;
             }
         }
@@ -957,45 +959,68 @@ CORE_OS_HTML = """<!DOCTYPE html>
             }
         }
 
+        let actionsStatusFilter = 'all';
+
         async function loadActions() {
             const content = document.getElementById('content');
             content.innerHTML = '<div class="empty-state">Loading...</div>';
 
             try {
-                const res = await fetch('/v1/actions?limit=50', { headers: getHeaders() });
+                const res = await fetch('/v1/actions?status=' + actionsStatusFilter + '&limit=50', { headers: getHeaders() });
                 if (!res.ok) throw new Error();
                 const data = await res.json();
+
+                const isAdmin = userRole === 'admin';
 
                 content.innerHTML = `
                     <div class="card">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
                             <h2>Actions (${data.total})</h2>
-                            <button class="btn" onclick="showCreateAction()">+ New Action</button>
+                            <div style="display:flex;gap:10px;align-items:center;">
+                                <select id="action-status-filter" onchange="changeActionsFilter()" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
+                                    <option value="all" ${actionsStatusFilter==='all'?'selected':''}>All</option>
+                                    <option value="proposed" ${actionsStatusFilter==='proposed'?'selected':''}>Proposed</option>
+                                    <option value="approved" ${actionsStatusFilter==='approved'?'selected':''}>Approved</option>
+                                    <option value="rejected" ${actionsStatusFilter==='rejected'?'selected':''}>Rejected</option>
+                                    <option value="executed" ${actionsStatusFilter==='executed'?'selected':''}>Executed</option>
+                                    <option value="cancelled" ${actionsStatusFilter==='cancelled'?'selected':''}>Cancelled</option>
+                                </select>
+                                <button class="btn" onclick="showCreateAction()">+ New Action</button>
+                            </div>
                         </div>
                         ${data.items.length ? `<table>
-                            <tr><th>Title</th><th>Type</th><th>Source</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+                            <tr><th>Created</th><th>Status</th><th>Title</th><th>Type</th><th>Creator</th><th>Assigned</th><th>Actions</th></tr>
                             ${data.items.map(a => `<tr>
-                                <td><a href="#" onclick="viewAction('${a.action_id}')">${escapeHtml(a.title)}</a></td>
-                                <td>${a.action_type}</td>
-                                <td>${a.source}</td>
-                                <td><span class="status-badge status-${a.status}">${a.status}</span></td>
                                 <td>${a.created_at.split('T')[0]}</td>
+                                <td><span class="status-badge status-${a.status}">${a.status}</span></td>
+                                <td><a href="#" onclick="viewActionDetail('${a.action_id}')">${escapeHtml(a.title)}</a></td>
+                                <td>${a.action_type}</td>
+                                <td>${a.created_by_user_id.substring(0,8)}...</td>
+                                <td>${a.assigned_to_user_id ? a.assigned_to_user_id.substring(0,8)+'...' : '-'}</td>
                                 <td class="action-buttons">
-                                    ${a.status === 'proposed' ? `
+                                    ${a.status === 'proposed' && isAdmin ? `
                                         <button class="btn btn-success" onclick="approveAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Approve</button>
                                         <button class="btn btn-danger" onclick="rejectAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Reject</button>
                                     ` : ''}
-                                    ${a.status === 'approved' ? `
+                                    ${a.status === 'proposed' ? `
+                                        <button class="btn btn-secondary" onclick="cancelAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Cancel</button>
+                                    ` : ''}
+                                    ${a.status === 'approved' && isAdmin ? `
                                         <button class="btn" onclick="executeAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Execute</button>
                                     ` : ''}
                                 </td>
                             </tr>`).join('')}
-                        </table>` : '<div class="empty-state">No actions yet</div>'}
+                        </table>` : '<div class="empty-state">No actions found</div>'}
                     </div>
                 `;
             } catch (e) {
                 content.innerHTML = '<div class="empty-state">Error loading actions</div>';
             }
+        }
+
+        function changeActionsFilter() {
+            actionsStatusFilter = document.getElementById('action-status-filter').value;
+            loadActions();
         }
 
         async function loadTasks() {
@@ -1147,6 +1172,52 @@ CORE_OS_HTML = """<!DOCTYPE html>
                 `;
             } catch (e) {
                 content.innerHTML = '<div class="empty-state">Error loading timeline</div>';
+            }
+        }
+
+        async function loadBilling() {
+            const content = document.getElementById('content');
+            content.innerHTML = '<div class="empty-state">Loading...</div>';
+
+            try {
+                const res = await fetch('/v1/billing/usage', { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const data = await res.json();
+
+                content.innerHTML = `
+                    <div class="card">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
+                            <h2>Billing Usage</h2>
+                            <button class="btn btn-secondary" onclick="loadBilling()">Refresh</button>
+                        </div>
+                        <div style="display:flex;gap:30px;margin-bottom:20px;">
+                            <div>
+                                <div style="font-size:24px;font-weight:bold;">${data.included_credits}</div>
+                                <div style="font-size:12px;color:#666;">Included Credits</div>
+                            </div>
+                            <div>
+                                <div style="font-size:24px;font-weight:bold;color:#0066cc;">${data.total_credits_used.toFixed(2)}</div>
+                                <div style="font-size:12px;color:#666;">Credits Used</div>
+                            </div>
+                            <div>
+                                <div style="font-size:24px;font-weight:bold;color:#00aa00;">${data.remaining_credits.toFixed(2)}</div>
+                                <div style="font-size:12px;color:#666;">Remaining</div>
+                            </div>
+                        </div>
+                        <h3 style="font-size:14px;margin-bottom:10px;">Usage Breakdown</h3>
+                        ${data.breakdown.length ? `<table>
+                            <tr><th>Event Type</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>
+                            ${data.breakdown.map(b => `<tr>
+                                <td>${b.event_key}</td>
+                                <td>${b.raw_units}</td>
+                                <td>${b.credits.toFixed(2)}</td>
+                                <td>$${b.list_cost_estimate.toFixed(4)}</td>
+                            </tr>`).join('')}
+                        </table>` : '<div class="empty-state">No usage yet</div>'}
+                    </div>
+                `;
+            } catch (e) {
+                content.innerHTML = '<div class="empty-state">Error loading billing data</div>';
             }
         }
 
@@ -1354,15 +1425,106 @@ CORE_OS_HTML = """<!DOCTYPE html>
         }
 
         async function executeAction(id) {
-            if (!confirm('Execute this action?')) return;
+            const resultInput = prompt('Enter execution result (JSON, leave empty for {}):');
+            let result = {};
+            if (resultInput) {
+                try { result = JSON.parse(resultInput); } catch(e) { alert('Invalid JSON'); return; }
+            }
+            const execStatus = prompt('Execution status (succeeded/failed/skipped):', 'succeeded');
+            if (!execStatus || !['succeeded','failed','skipped'].includes(execStatus)) {
+                alert('Invalid execution status'); return;
+            }
             try {
                 const res = await fetch('/v1/actions/' + id + '/execute', {
                     method: 'POST', headers: getHeaders(),
-                    body: JSON.stringify({ execution_status: 'succeeded', result: {} })
+                    body: JSON.stringify({ execution_status: execStatus, result: result })
                 });
+                if (!res.ok) {
+                    const errData = await res.json();
+                    throw new Error(typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail));
+                }
+                loadActions();
+            } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function cancelAction(id) {
+            if (!confirm('Cancel this action?')) return;
+            try {
+                const res = await fetch('/v1/actions/' + id + '/cancel', { method: 'POST', headers: getHeaders(), body: '{}' });
                 if (!res.ok) throw new Error((await res.json()).detail);
                 loadActions();
             } catch (e) { alert('Error: ' + e.message); }
+        }
+
+        async function viewActionDetail(id) {
+            try {
+                const res = await fetch('/v1/actions/' + id, { headers: getHeaders() });
+                if (!res.ok) throw new Error();
+                const a = await res.json();
+
+                let body = `
+                    <div class="detail-section">
+                        <h4>Action Details</h4>
+                        <p><strong>ID:</strong> ${a.action_id}</p>
+                        <p><strong>Title:</strong> ${escapeHtml(a.title)}</p>
+                        <p><strong>Status:</strong> <span class="status-badge status-${a.status}">${a.status}</span></p>
+                        <p><strong>Type:</strong> ${a.action_type}</p>
+                        <p><strong>Source:</strong> ${a.source}</p>
+                        <p><strong>Description:</strong> ${escapeHtml(a.description || '-')}</p>
+                        <p><strong>Created By:</strong> ${a.created_by_user_id}</p>
+                        <p><strong>Assigned To:</strong> ${a.assigned_to_user_id || '-'}</p>
+                        <p><strong>Created:</strong> ${a.created_at}</p>
+                        <p><strong>Updated:</strong> ${a.updated_at}</p>
+                    </div>
+                    <div class="detail-section">
+                        <h4>Payload</h4>
+                        <pre>${JSON.stringify(a.payload, null, 2)}</pre>
+                    </div>
+                `;
+
+                if (a.review) {
+                    body += `
+                        <div class="detail-section" style="border-top:1px solid #eee;padding-top:15px;">
+                            <h4>Review</h4>
+                            <p><strong>Decision:</strong> <span class="status-badge status-${a.review.decision}">${a.review.decision}</span></p>
+                            <p><strong>Reviewer:</strong> ${a.review.reviewer_user_id}</p>
+                            <p><strong>Comment:</strong> ${escapeHtml(a.review.comment || '-')}</p>
+                            <p><strong>Time:</strong> ${a.review.created_at}</p>
+                        </div>
+                    `;
+                }
+
+                if (a.execution) {
+                    body += `
+                        <div class="detail-section" style="border-top:1px solid #eee;padding-top:15px;">
+                            <h4>Execution</h4>
+                            <p><strong>Execution ID:</strong> ${a.execution.execution_id}</p>
+                            <p><strong>Status:</strong> <span class="status-badge status-${a.execution.execution_status === 'succeeded' ? 'done' : a.execution.execution_status === 'failed' ? 'rejected' : 'cancelled'}">${a.execution.execution_status}</span></p>
+                            <p><strong>Executed By:</strong> ${a.execution.executed_by_user_id}</p>
+                            <p><strong>Time:</strong> ${a.execution.created_at}</p>
+                            <p><strong>Result:</strong></p>
+                            <pre>${JSON.stringify(a.execution.result, null, 2)}</pre>
+                        </div>
+                    `;
+                }
+
+                // Add action buttons based on status
+                const isAdmin = userRole === 'admin';
+                body += '<div style="margin-top:20px;display:flex;gap:10px;">';
+                if (a.status === 'proposed' && isAdmin) {
+                    body += `<button class="btn btn-success" onclick="closeModal();approveAction('${a.action_id}')">Approve</button>`;
+                    body += `<button class="btn btn-danger" onclick="closeModal();rejectAction('${a.action_id}')">Reject</button>`;
+                }
+                if (a.status === 'proposed') {
+                    body += `<button class="btn btn-secondary" onclick="closeModal();cancelAction('${a.action_id}')">Cancel</button>`;
+                }
+                if (a.status === 'approved' && isAdmin) {
+                    body += `<button class="btn" onclick="closeModal();executeAction('${a.action_id}')">Execute</button>`;
+                }
+                body += '</div>';
+
+                openModal('Action: ' + escapeHtml(a.title), body);
+            } catch (e) { alert('Error loading action details'); }
         }
 
         async function completeTask(id) {
