@@ -80,6 +80,24 @@ class ActionExecute(BaseModel):
     result: dict[str, Any] = Field(default_factory=dict)
 
 
+class ActionExecutionResponse(BaseModel):
+    """Response schema for an action execution record."""
+    execution_id: str
+    action_id: str
+    executed_by_user_id: str
+    execution_status: str
+    result: dict[str, Any]
+    created_at: str
+
+
+class ActionReviewResponse(BaseModel):
+    """Response schema for an action review record."""
+    decision: str
+    reviewer_user_id: str
+    comment: str | None
+    created_at: str
+
+
 class ActionResponse(BaseModel):
     """Response schema for an action."""
     action_id: str
@@ -98,6 +116,34 @@ class ActionResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ActionDetailResponse(BaseModel):
+    """Response schema for action detail including review and execution."""
+    action_id: str
+    tenant_id: str
+    created_by_user_id: str
+    assigned_to_user_id: str | None
+    source: str
+    source_ref: str | None
+    status: str
+    title: str
+    description: str | None
+    action_type: str
+    payload: dict[str, Any]
+    created_at: str
+    updated_at: str
+    review: ActionReviewResponse | None = None
+    execution: ActionExecutionResponse | None = None
+
+    class Config:
+        from_attributes = True
+
+
+class ActionExecuteResultResponse(BaseModel):
+    """Response schema for execute action endpoint."""
+    action: ActionResponse
+    execution: ActionExecutionResponse
 
 
 class ActionListResponse(BaseModel):
@@ -371,6 +417,15 @@ class RecordExplorerResponse(BaseModel):
     timeline: list[TimelineEventResponse]
 
 
+# User Info Schema
+class CurrentUserResponse(BaseModel):
+    """Response schema for current user info (/v1/me)."""
+    user_id: str
+    tenant_id: str
+    email: str
+    role: str
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -420,6 +475,23 @@ def log_audit(
     )
     db.add(audit)
     return audit
+
+
+# =============================================================================
+# User Info Endpoint
+# =============================================================================
+
+@router.get("/me", response_model=CurrentUserResponse)
+def get_current_user(
+    context: Annotated[TenantContext, Depends(get_tenant_context)],
+) -> CurrentUserResponse:
+    """Get current user info (role, email, etc.) for UI role-based functionality."""
+    return CurrentUserResponse(
+        user_id=context.user_id,
+        tenant_id=context.tenant_id,
+        email=context.user.email,
+        role=context.user.role,
+    )
 
 
 # =============================================================================
@@ -551,13 +623,13 @@ def list_actions(
     return ActionListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
-@router.get("/actions/{action_id}", response_model=ActionResponse)
+@router.get("/actions/{action_id}", response_model=ActionDetailResponse)
 def get_action(
     action_id: str,
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
-) -> ActionResponse:
-    """Get a specific action."""
+) -> ActionDetailResponse:
+    """Get a specific action with optional review and execution data."""
     check_entitlement(db, context.tenant_id, "action_center")
 
     action = db.query(Action).filter(
@@ -568,7 +640,37 @@ def get_action(
     if not action:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
 
-    return ActionResponse(
+    # Fetch review record if exists
+    review_response = None
+    review = db.query(ActionReview).filter(
+        ActionReview.tenant_id == context.tenant_id,
+        ActionReview.action_id == action_id
+    ).first()
+    if review:
+        review_response = ActionReviewResponse(
+            decision=review.decision,
+            reviewer_user_id=review.reviewer_user_id,
+            comment=review.comment,
+            created_at=review.created_at,
+        )
+
+    # Fetch execution record if exists
+    execution_response = None
+    execution = db.query(ActionExecution).filter(
+        ActionExecution.tenant_id == context.tenant_id,
+        ActionExecution.action_id == action_id
+    ).first()
+    if execution:
+        execution_response = ActionExecutionResponse(
+            execution_id=execution.execution_id,
+            action_id=execution.action_id,
+            executed_by_user_id=execution.executed_by_user_id,
+            execution_status=execution.execution_status,
+            result=json.loads(execution.result_json),
+            created_at=execution.created_at,
+        )
+
+    return ActionDetailResponse(
         action_id=action.action_id,
         tenant_id=action.tenant_id,
         created_by_user_id=action.created_by_user_id,
@@ -582,6 +684,8 @@ def get_action(
         payload=json.loads(action.payload_json),
         created_at=action.created_at,
         updated_at=action.updated_at,
+        review=review_response,
+        execution=execution_response,
     )
 
 
@@ -983,14 +1087,18 @@ def reject_action(
     )
 
 
-@router.post("/actions/{action_id}/execute", response_model=ActionResponse)
+@router.post("/actions/{action_id}/execute", response_model=ActionExecuteResultResponse)
 def execute_action(
     action_id: str,
     execute_data: ActionExecute,
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
-) -> ActionResponse:
-    """Execute an approved action (admin only, stub for now)."""
+) -> ActionExecuteResultResponse:
+    """Execute an approved action (admin only, stub for now).
+
+    Returns both the action and execution records. Idempotent: if action is
+    already executed, returns existing data without emitting usage/timeline.
+    """
     request_id = str(uuid.uuid4())
     check_entitlement(db, context.tenant_id, "action_center")
     require_admin(context)
@@ -1003,15 +1111,57 @@ def execute_action(
     if not action:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action not found")
 
+    # Idempotent: if already executed, return existing data without emitting usage/audit/timeline
+    if action.status == "executed":
+        existing_execution = db.query(ActionExecution).filter(
+            ActionExecution.tenant_id == context.tenant_id,
+            ActionExecution.action_id == action_id
+        ).first()
+
+        if existing_execution:
+            return ActionExecuteResultResponse(
+                action=ActionResponse(
+                    action_id=action.action_id,
+                    tenant_id=action.tenant_id,
+                    created_by_user_id=action.created_by_user_id,
+                    assigned_to_user_id=action.assigned_to_user_id,
+                    source=action.source,
+                    source_ref=action.source_ref,
+                    status=action.status,
+                    title=action.title,
+                    description=action.description,
+                    action_type=action.action_type,
+                    payload=json.loads(action.payload_json),
+                    created_at=action.created_at,
+                    updated_at=action.updated_at,
+                ),
+                execution=ActionExecutionResponse(
+                    execution_id=existing_execution.execution_id,
+                    action_id=existing_execution.action_id,
+                    executed_by_user_id=existing_execution.executed_by_user_id,
+                    execution_status=existing_execution.execution_status,
+                    result=json.loads(existing_execution.result_json),
+                    created_at=existing_execution.created_at,
+                ),
+            )
+
+    # Status transition enforcement: only approved -> executed is allowed
     if action.status != "approved":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Can only execute approved actions")
+        detail = {
+            "error": "invalid_status_transition",
+            "current_status": action.status,
+            "message": f"Cannot execute action with status '{action.status}'. Only 'approved' actions can be executed.",
+        }
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail)
 
     check_billing_quota(db, context.tenant_id, "action_executed", 1)
 
     now_iso = get_current_utc_datetime_iso()
+    execution_id = str(uuid.uuid4())
 
     # Create execution record (stub - does not actually invoke anything yet)
     execution = ActionExecution(
+        execution_id=execution_id,
         tenant_id=context.tenant_id,
         action_id=action_id,
         executed_by_user_id=context.user_id,
@@ -1028,7 +1178,7 @@ def execute_action(
         db, context.tenant_id, context.user_id,
         "action_executed", "action", action_id,
         f"Action executed: {action.title} ({execute_data.execution_status})",
-        {"executor": context.user_id, "execution_status": execute_data.execution_status}
+        {"action_id": action_id, "execution_id": execution_id, "executed_by": context.user_id, "execution_status": execute_data.execution_status}
     )
 
     log_audit(db, context.tenant_id, context.user_id, "actions.execute", "action_center", request_id)
@@ -1036,21 +1186,32 @@ def execute_action(
 
     db.commit()
     db.refresh(action)
+    db.refresh(execution)
 
-    return ActionResponse(
-        action_id=action.action_id,
-        tenant_id=action.tenant_id,
-        created_by_user_id=action.created_by_user_id,
-        assigned_to_user_id=action.assigned_to_user_id,
-        source=action.source,
-        source_ref=action.source_ref,
-        status=action.status,
-        title=action.title,
-        description=action.description,
-        action_type=action.action_type,
-        payload=json.loads(action.payload_json),
-        created_at=action.created_at,
-        updated_at=action.updated_at,
+    return ActionExecuteResultResponse(
+        action=ActionResponse(
+            action_id=action.action_id,
+            tenant_id=action.tenant_id,
+            created_by_user_id=action.created_by_user_id,
+            assigned_to_user_id=action.assigned_to_user_id,
+            source=action.source,
+            source_ref=action.source_ref,
+            status=action.status,
+            title=action.title,
+            description=action.description,
+            action_type=action.action_type,
+            payload=json.loads(action.payload_json),
+            created_at=action.created_at,
+            updated_at=action.updated_at,
+        ),
+        execution=ActionExecutionResponse(
+            execution_id=execution.execution_id,
+            action_id=execution.action_id,
+            executed_by_user_id=execution.executed_by_user_id,
+            execution_status=execution.execution_status,
+            result=json.loads(execution.result_json),
+            created_at=execution.created_at,
+        ),
     )
 
 

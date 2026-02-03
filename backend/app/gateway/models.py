@@ -376,6 +376,7 @@ class ActionExecution(Base):
     __tablename__ = "action_executions"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    execution_id = Column(String(36), nullable=False, unique=True)  # UUID for API response
     tenant_id = Column(String(36), nullable=False)
     action_id = Column(String(36), nullable=False)
     executed_by_user_id = Column(String(36), nullable=False)
@@ -384,6 +385,8 @@ class ActionExecution(Base):
     created_at = Column(String(30), nullable=False)  # ISO 8601
 
     __table_args__ = (
+        # Only one execution per action (v0 - exactly one execution)
+        UniqueConstraint("tenant_id", "action_id", name="uq_action_execution_tenant_action"),
         Index("ix_action_executions_tenant_action_created", "tenant_id", "action_id", "created_at"),
     )
 

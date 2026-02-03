@@ -685,7 +685,9 @@ class TestFullWorkflows:
             headers=admin_a_headers,
         )
         assert response.status_code == 200
-        assert response.json()["status"] == "executed"
+        # Execute returns {action: {...}, execution: {...}}
+        assert response.json()["action"]["status"] == "executed"
+        assert response.json()["execution"]["execution_status"] == "succeeded"
 
         # Verify timeline has all events
         response = client.get(
@@ -1832,3 +1834,430 @@ class TestActionsApprovalsV0ListFilters:
         items = response.json()["items"]
         assert len(items) >= 1
         assert all(a["status"] == "rejected" for a in items)
+
+
+# =============================================================================
+# Actions Execute v0 Tests (Phase 1, Task 8c)
+# =============================================================================
+
+class TestActionsExecuteV0HappyPath:
+    """Test action execute happy path (Phase 1 Task 8c)."""
+
+    def test_execute_happy_path(self, client, admin_a_headers, member_a_headers):
+        """Admin can execute an approved action; creates execution record + timeline + metering."""
+        # Member creates action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Execute Test", "action_type": "general", "payload": {"key": "value"}},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        action_id = response.json()["action_id"]
+
+        # Admin approves action
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Admin executes action
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {"message": "Done"}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check action status
+        assert data["action"]["status"] == "executed"
+
+        # Check execution record
+        assert "execution" in data
+        assert data["execution"]["execution_status"] == "succeeded"
+        assert data["execution"]["result"] == {"message": "Done"}
+        assert "execution_id" in data["execution"]
+
+        # Verify exactly one action_executions row exists
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionExecution
+        executions = db.query(ActionExecution).filter(
+            ActionExecution.action_id == action_id
+        ).all()
+        assert len(executions) == 1
+        assert executions[0].execution_status == "succeeded"
+        db.close()
+
+        # Verify timeline has action_executed event
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        events = response.json()["items"]
+        executed_events = [e for e in events if e["event_type"] == "action_executed"]
+        assert len(executed_events) == 1
+        assert "execution_id" in executed_events[0]["metadata"]
+
+        # Verify billing usage includes action_executed
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        action_executed = next((b for b in breakdown if b["event_key"] == "action_executed"), None)
+        assert action_executed is not None
+        assert action_executed["raw_units"] >= 1
+        assert action_executed["credits"] == action_executed["raw_units"] * 0.3
+
+    def test_execute_includes_action_detail_with_execution(self, client, admin_a_headers):
+        """GET action detail includes execution data after execution."""
+        # Create, approve, and execute action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Detail Test", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+        client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {"output": "test"}},
+            headers=admin_a_headers,
+        )
+
+        # Get action detail
+        response = client.get(f"/v1/actions/{action_id}", headers=admin_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check review and execution are present
+        assert data["review"] is not None
+        assert data["review"]["decision"] == "approved"
+        assert data["execution"] is not None
+        assert data["execution"]["execution_status"] == "succeeded"
+
+
+class TestActionsExecuteV0RBAC:
+    """Test RBAC for action execute (Phase 1 Task 8c)."""
+
+    def test_member_cannot_execute(self, client, admin_a_headers, member_a_headers):
+        """Member should not be able to execute an action (403)."""
+        # Create and approve action as admin
+        response = client.post(
+            "/v1/actions",
+            json={"title": "RBAC Test", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Member tries to execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 403
+
+
+class TestActionsExecuteV0TenantIsolation:
+    """Test tenant isolation for action execute (Phase 1 Task 8c)."""
+
+    def test_cross_tenant_execute_returns_404(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B admin cannot execute Tenant A's action (returns 404)."""
+        # Create and approve action in tenant A
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Tenant A Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Tenant B admin tries to execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_b_headers,
+        )
+        assert response.status_code == 404
+
+
+class TestActionsExecuteV0StatusTransitions:
+    """Test status transition enforcement for execute (Phase 1 Task 8c)."""
+
+    def test_execute_proposed_returns_409(self, client, admin_a_headers):
+        """Cannot execute a proposed action (returns 409)."""
+        # Create action (stays proposed)
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Proposed Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+
+        # Try to execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["error"] == "invalid_status_transition"
+        assert detail["current_status"] == "proposed"
+
+    def test_execute_rejected_returns_409(self, client, admin_a_headers):
+        """Cannot execute a rejected action (returns 409)."""
+        # Create and reject action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Rejected Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/reject", json={}, headers=admin_a_headers)
+
+        # Try to execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["current_status"] == "rejected"
+
+    def test_execute_cancelled_returns_409(self, client, admin_a_headers):
+        """Cannot execute a cancelled action (returns 409)."""
+        # Create and cancel action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Cancelled Action", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/cancel", json={}, headers=admin_a_headers)
+
+        # Try to execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 409
+        assert response.json()["detail"]["current_status"] == "cancelled"
+
+
+class TestActionsExecuteV0Idempotency:
+    """Test idempotent retry behavior for execute (Phase 1 Task 8c)."""
+
+    def test_execute_idempotent(self, client, admin_a_headers):
+        """Executing an already executed action returns 200 without additional writes."""
+        # Create and approve action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Idempotent Test", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # First execute
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {"first": True}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        first_execution_id = response.json()["execution"]["execution_id"]
+
+        # Get usage after first execute
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        executed_after_first = next(
+            (b for b in breakdown if b["event_key"] == "action_executed"),
+            {"raw_units": 0}
+        )
+
+        # Get execution count
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionExecution
+        exec_count_1 = db.query(ActionExecution).filter(ActionExecution.action_id == action_id).count()
+        db.close()
+
+        # Get timeline event count
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        executed_events_1 = len([e for e in response.json()["items"] if e["event_type"] == "action_executed"])
+
+        # Second execute (idempotent)
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "failed", "result": {"second": True}},  # Different values
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        # Should return original execution, not the new one
+        assert response.json()["execution"]["execution_id"] == first_execution_id
+        assert response.json()["execution"]["result"] == {"first": True}
+
+        # Usage should NOT have incremented
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        executed_after_second = next(
+            (b for b in breakdown if b["event_key"] == "action_executed"),
+            {"raw_units": 0}
+        )
+        assert executed_after_second["raw_units"] == executed_after_first["raw_units"]
+
+        # Execution count should NOT have incremented
+        db = TestingSessionLocal()
+        exec_count_2 = db.query(ActionExecution).filter(ActionExecution.action_id == action_id).count()
+        db.close()
+        assert exec_count_2 == exec_count_1
+
+        # Timeline event count should NOT have incremented
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        executed_events_2 = len([e for e in response.json()["items"] if e["event_type"] == "action_executed"])
+        assert executed_events_2 == executed_events_1
+
+
+class TestActionsExecuteV0QuotaEnforcement:
+    """Test quota enforcement for execute (no partial writes) (Phase 1 Task 8c)."""
+
+    def test_execute_quota_exceeded_no_partial_writes(self, client, tenant_a, admin_a_headers):
+        """When execute quota exceeded, returns 429 and no partial writes happen."""
+        platform_headers = {"X-Platform-Admin-Key": "test-admin-key"}
+
+        # Create a test plan with cap of 0 for action_executed (immediate failure)
+        response = client.post(
+            "/v1/admin/plans",
+            json={
+                "plan_id": "test_no_execute",
+                "name": "No Execute Plan",
+                "included_credits": 1000,
+                "overage_price_per_credit": 0.02,
+            },
+            headers=platform_headers,
+        )
+        assert response.status_code in [200, 201, 409]
+
+        # Add capabilities
+        client.put(
+            "/v1/admin/plans/test_no_execute/capabilities",
+            json={"capabilities": ["action_center", "timeline"]},
+            headers=platform_headers,
+        )
+
+        # Add event cap of 0 for action_executed
+        client.put(
+            "/v1/admin/plans/test_no_execute/caps",
+            json={
+                "caps": [
+                    {"event_key": "action_executed", "period": "monthly", "cap_raw_units": 0}
+                ]
+            },
+            headers=platform_headers,
+        )
+
+        # Assign the limited plan to the tenant
+        client.put(
+            f"/v1/admin/tenants/{tenant_a['tenant_id']}/subscription",
+            json={"plan_id": "test_no_execute", "status": "active"},
+            headers=platform_headers,
+        )
+
+        # Create and approve action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "Quota Test", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+
+        # Try to execute (should fail with 429)
+        response = client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 429
+
+        # Verify action remains "approved"
+        response = client.get(f"/v1/actions/{action_id}", headers=admin_a_headers)
+        assert response.json()["status"] == "approved"
+
+        # Verify no execution row was created
+        db = TestingSessionLocal()
+        from app.gateway.models import ActionExecution
+        exec_count = db.query(ActionExecution).filter(ActionExecution.action_id == action_id).count()
+        assert exec_count == 0
+        db.close()
+
+        # Verify no action_executed timeline event
+        response = client.get(
+            f"/v1/timeline?entity_type=action&entity_id={action_id}",
+            headers=admin_a_headers,
+        )
+        events = response.json()["items"]
+        executed_events = [e for e in events if e["event_type"] == "action_executed"]
+        assert len(executed_events) == 0
+
+
+class TestActionsExecuteV0ListFilter:
+    """Test list endpoint filter for executed status (Phase 1 Task 8c)."""
+
+    def test_list_status_filter_executed(self, client, admin_a_headers):
+        """Can filter by status=executed."""
+        # Create, approve, and execute an action
+        response = client.post(
+            "/v1/actions",
+            json={"title": "To Execute", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+        action_id = response.json()["action_id"]
+        client.post(f"/v1/actions/{action_id}/approve", json={}, headers=admin_a_headers)
+        client.post(
+            f"/v1/actions/{action_id}/execute",
+            json={"execution_status": "succeeded", "result": {}},
+            headers=admin_a_headers,
+        )
+
+        # Create another action that stays proposed
+        client.post(
+            "/v1/actions",
+            json={"title": "Stay Proposed", "action_type": "general"},
+            headers=admin_a_headers,
+        )
+
+        # List executed only
+        response = client.get("/v1/actions?status=executed", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) >= 1
+        assert all(a["status"] == "executed" for a in items)
+
+
+# =============================================================================
+# /v1/me Endpoint Tests (Phase 1, Task 8c)
+# =============================================================================
+
+class TestMeEndpoint:
+    """Test /v1/me endpoint."""
+
+    def test_me_returns_user_info(self, client, admin_a_headers, tenant_a):
+        """GET /v1/me returns user info including role and email."""
+        response = client.get("/v1/me", headers=admin_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["user_id"] == tenant_a["admin"]["user_id"]
+        assert data["tenant_id"] == tenant_a["tenant_id"]
+        assert data["role"] == "admin"
+        assert data["email"] == "admin-a@test.com"
+
+    def test_me_returns_member_role(self, client, member_a_headers, member_a):
+        """GET /v1/me returns correct role for member."""
+        response = client.get("/v1/me", headers=member_a_headers)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["role"] == "member"
+        assert data["email"] == "member-a@test.com"
