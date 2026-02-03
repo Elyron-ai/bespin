@@ -903,3 +903,179 @@ bespin/
     ├── smoke_phase1_task8b_action_approvals.sh  # Action Approvals smoke test
     └── smoke_phase1_task8c_action_execute.sh    # Action Execute smoke test
 ```
+
+## Testing Action Center UI (Phase 1, Task 8d)
+
+The Action Center UI provides a web interface for managing actions through their complete lifecycle.
+
+### Starting the Server
+
+```bash
+cd backend
+
+# Enable the UI
+export PLAYGROUND_UI_ENABLED=1
+export DEV_CONSOLE_ENABLED=1
+export DEV_CONSOLE_KEY=dev-secret
+
+# Start the server
+poetry run uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+### Accessing the UI
+
+Open in browser: `http://localhost:8000/app`
+
+### Manual Test Steps
+
+#### 1. Setup Credentials
+
+First, create a tenant and users using curl (or the smoke tests):
+
+```bash
+# Create tenant
+TENANT=$(curl -s -X POST http://localhost:8000/v1/tenants \
+  -H "Content-Type: application/json" \
+  -d '{"name": "Test Corp", "region": "us-east-1", "admin_email": "admin@test.com"}')
+
+TENANT_ID=$(echo $TENANT | jq -r '.tenant_id')
+API_KEY=$(echo $TENANT | jq -r '.api_key')
+ADMIN_ID=$(echo $TENANT | jq -r '.admin.user_id')
+
+# Create member user
+MEMBER=$(curl -s -X POST http://localhost:8000/v1/users \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: $TENANT_ID" \
+  -H "X-User-ID: $ADMIN_ID" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"tenant_id": "'$TENANT_ID'", "email": "member@test.com", "role": "member"}')
+
+MEMBER_ID=$(echo $MEMBER | jq -r '.user_id')
+
+echo "Tenant ID: $TENANT_ID"
+echo "API Key: $API_KEY"
+echo "Admin ID: $ADMIN_ID"
+echo "Member ID: $MEMBER_ID"
+```
+
+#### 2. Test as Member User
+
+1. Open `http://localhost:8000/app`
+2. Enter credentials:
+   - Tenant ID: (from above)
+   - API Key: (from above)
+   - User ID: (MEMBER_ID from above)
+3. Click **Connect**
+4. Verify "Role: member" appears in the header
+
+**Create an Action:**
+1. Click **Actions** in the sidebar
+2. Click **+ New Action**
+3. Fill in the form:
+   - Title: "Contact Acme Corp"
+   - Description: "Follow up on enterprise deal"
+   - Action Type: "outreach"
+   - Payload: `{"company": "Acme Corp", "contact": "john@acme.com"}`
+4. Click **Create Action**
+5. Verify the action appears in the list with status "proposed"
+6. Verify the action detail modal opens showing all fields
+
+**Test Filters:**
+1. Use the status dropdown to filter by "Proposed"
+2. Check "Created by me" checkbox
+3. Verify the action list updates correctly
+
+**View Diagnostics:**
+1. Note the "Last API Response" panel at bottom-right
+2. It shows the full JSON response from each API call
+
+#### 3. Switch to Admin User
+
+1. Change User ID field to ADMIN_ID
+2. Click **Connect**
+3. Verify "Role: admin" appears in the header
+
+**Approve an Action:**
+1. Click **Actions** in the sidebar
+2. Find the proposed action created by member
+3. Click **Approve** button
+4. Add a comment: "Approved for Q1 outreach"
+5. Click **Approve** in the dialog
+6. Verify status changes to "approved"
+7. Check the Diagnostics panel for the API response
+
+**Execute the Action:**
+1. Click **Execute** on the approved action
+2. Select status: "succeeded"
+3. Enter result JSON: `{"email_sent": true, "response_expected": "2026-02-10"}`
+4. Click **Execute**
+5. Verify status changes to "executed"
+
+**View Action Detail:**
+1. Click on the action title to open detail view
+2. Verify you see:
+   - Action details (title, type, status, etc.)
+   - Payload JSON (pretty-printed)
+   - Review section (decision, reviewer, comment, timestamp)
+   - Execution section (status, executor, result JSON, timestamp)
+
+#### 4. Verify Timeline
+
+1. Click **Timeline** in the sidebar
+2. Verify events for:
+   - action_created
+   - action_approved
+   - action_executed
+
+#### 5. Verify Billing Usage
+
+1. Click **Billing** in the sidebar
+2. Verify the "Action Center Usage" section shows:
+   - action_created: 1 unit
+   - action_approved: 1 unit
+   - action_executed: 1 unit
+3. Click **Refresh** to update the display
+
+#### 6. Test Cancel (as Member)
+
+1. Switch back to MEMBER_ID
+2. Click **Connect**
+3. Create a new action
+4. Click **Cancel** on your own action
+5. Verify status changes to "cancelled"
+6. Verify you can only cancel your own proposed actions (not other users')
+
+### Common Errors
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| 401 Unauthorized | Invalid API key | Check API key matches tenant |
+| 403 Forbidden | Insufficient role | Admin-only operations require admin role |
+| 403 Forbidden | Not creator | Members can only cancel their own actions |
+| 404 Not Found | Wrong tenant | Action belongs to different tenant |
+| 409 Conflict | Invalid transition | Can't approve rejected action, etc. |
+| 429 Too Many Requests | Quota exceeded | Check billing usage, upgrade plan |
+
+### UI Features
+
+- **Diagnostics Panel**: Bottom-right panel shows last API response (expand/collapse with +/_ button)
+- **Created by me Filter**: Checkbox to show only actions you created
+- **Status Filter**: Dropdown to filter by action status
+- **Comment Input**: Approve/reject dialogs include optional comment field
+- **JSON Validation**: Payload and result fields validate JSON before submission
+- **Role-aware Buttons**: Admin-only buttons hidden for member users
+
+### API Endpoints Used by UI
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/me` | Get current user role and email |
+| `GET /v1/actions` | List actions with filters |
+| `POST /v1/actions` | Create new action |
+| `GET /v1/actions/{id}` | Get action detail with review/execution |
+| `POST /v1/actions/{id}/approve` | Approve action (admin only) |
+| `POST /v1/actions/{id}/reject` | Reject action (admin only) |
+| `POST /v1/actions/{id}/execute` | Execute action (admin only) |
+| `POST /v1/actions/{id}/cancel` | Cancel action (creator or admin) |
+| `GET /v1/timeline` | Get timeline events |
+| `GET /v1/billing/usage` | Get billing usage breakdown |

@@ -780,6 +780,48 @@ CORE_OS_HTML = """<!DOCTYPE html>
         .empty-state { text-align: center; color: #999; padding: 40px; font-size: 14px; }
         .action-buttons { display: flex; gap: 8px; }
         pre { background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px; }
+        .diagnostics-panel {
+            position: fixed;
+            bottom: 0;
+            right: 0;
+            width: 400px;
+            max-height: 300px;
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px 0 0 0;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.1);
+            z-index: 100;
+            display: flex;
+            flex-direction: column;
+        }
+        .diagnostics-header {
+            padding: 8px 12px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        .diagnostics-toggle {
+            cursor: pointer;
+            color: #666;
+            font-size: 14px;
+        }
+        .diagnostics-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 11px;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .diagnostics-body.error { color: #cc0000; background: #fff5f5; }
+        .diagnostics-body.success { color: #006600; background: #f5fff5; }
+        .checkbox-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .checkbox-row input[type="checkbox"] { width: auto; margin: 0; }
     </style>
 </head>
 <body>
@@ -828,12 +870,64 @@ CORE_OS_HTML = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Diagnostics Panel -->
+    <div class="diagnostics-panel" id="diagnostics-panel">
+        <div class="diagnostics-header">
+            <span>Last API Response</span>
+            <span class="diagnostics-toggle" onclick="toggleDiagnostics()">_</span>
+        </div>
+        <div class="diagnostics-body" id="diagnostics-body">No API calls yet</div>
+    </div>
+
     <script>
         let currentSection = 'today';
         let userRole = 'member';
+        let diagnosticsMinimized = false;
+        let lastApiResponse = null;
+        let actionsCreatedByMeFilter = false;
 
         window.DEV_CONSOLE_ENABLED = {DEV_CONSOLE_ENABLED};
         window.DEV_CONSOLE_KEY = '{DEV_CONSOLE_KEY}';
+
+        // Diagnostics panel functions
+        function toggleDiagnostics() {
+            diagnosticsMinimized = !diagnosticsMinimized;
+            const panel = document.getElementById('diagnostics-panel');
+            const body = document.getElementById('diagnostics-body');
+            const toggle = document.querySelector('.diagnostics-toggle');
+            if (diagnosticsMinimized) {
+                body.style.display = 'none';
+                panel.style.maxHeight = '35px';
+                toggle.textContent = '+';
+            } else {
+                body.style.display = 'block';
+                panel.style.maxHeight = '300px';
+                toggle.textContent = '_';
+            }
+        }
+
+        function updateDiagnostics(response, data, isError = false) {
+            const body = document.getElementById('diagnostics-body');
+            const timestamp = new Date().toLocaleTimeString();
+            let content = `[${timestamp}] ${response.status} ${response.statusText}\nURL: ${response.url}\n\n`;
+            content += JSON.stringify(data, null, 2);
+            body.textContent = content;
+            body.className = 'diagnostics-body ' + (isError ? 'error' : 'success');
+            lastApiResponse = { response, data, isError };
+        }
+
+        // Wrapper for fetch that logs to diagnostics
+        async function apiFetch(url, options = {}) {
+            try {
+                const res = await fetch(url, options);
+                const data = await res.json();
+                updateDiagnostics(res, data, !res.ok);
+                return { res, data, ok: res.ok };
+            } catch (e) {
+                updateDiagnostics({ status: 0, statusText: 'Network Error', url }, { error: e.message }, true);
+                throw e;
+            }
+        }
 
         document.addEventListener('DOMContentLoaded', () => {
             // Load saved config
@@ -966,17 +1060,25 @@ CORE_OS_HTML = """<!DOCTYPE html>
             content.innerHTML = '<div class="empty-state">Loading...</div>';
 
             try {
-                const res = await fetch('/v1/actions?status=' + actionsStatusFilter + '&limit=50', { headers: getHeaders() });
-                if (!res.ok) throw new Error();
-                const data = await res.json();
+                let url = '/v1/actions?status=' + actionsStatusFilter + '&limit=50';
+                if (actionsCreatedByMeFilter) {
+                    url += '&created_by_user_id=' + encodeURIComponent(document.getElementById('user-id').value);
+                }
+                const { res, data, ok } = await apiFetch(url, { headers: getHeaders() });
+                if (!ok) throw new Error(data.detail || 'Failed to load actions');
 
                 const isAdmin = userRole === 'admin';
+                const currentUserId = document.getElementById('user-id').value;
 
                 content.innerHTML = `
                     <div class="card">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
                             <h2>Actions (${data.total})</h2>
                             <div style="display:flex;gap:10px;align-items:center;">
+                                <label style="font-size:12px;display:flex;align-items:center;gap:5px;">
+                                    <input type="checkbox" id="created-by-me-filter" onchange="toggleCreatedByMeFilter()" ${actionsCreatedByMeFilter?'checked':''}>
+                                    Created by me
+                                </label>
                                 <select id="action-status-filter" onchange="changeActionsFilter()" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
                                     <option value="all" ${actionsStatusFilter==='all'?'selected':''}>All</option>
                                     <option value="proposed" ${actionsStatusFilter==='proposed'?'selected':''}>Proposed</option>
@@ -999,14 +1101,14 @@ CORE_OS_HTML = """<!DOCTYPE html>
                                 <td>${a.assigned_to_user_id ? a.assigned_to_user_id.substring(0,8)+'...' : '-'}</td>
                                 <td class="action-buttons">
                                     ${a.status === 'proposed' && isAdmin ? `
-                                        <button class="btn btn-success" onclick="approveAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Approve</button>
-                                        <button class="btn btn-danger" onclick="rejectAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Reject</button>
+                                        <button class="btn btn-success" onclick="showApproveDialog('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Approve</button>
+                                        <button class="btn btn-danger" onclick="showRejectDialog('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Reject</button>
                                     ` : ''}
-                                    ${a.status === 'proposed' ? `
+                                    ${a.status === 'proposed' && (isAdmin || a.created_by_user_id === currentUserId) ? `
                                         <button class="btn btn-secondary" onclick="cancelAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Cancel</button>
                                     ` : ''}
                                     ${a.status === 'approved' && isAdmin ? `
-                                        <button class="btn" onclick="executeAction('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Execute</button>
+                                        <button class="btn" onclick="showExecuteDialog('${a.action_id}')" style="padding:4px 8px;font-size:11px;">Execute</button>
                                     ` : ''}
                                 </td>
                             </tr>`).join('')}
@@ -1014,12 +1116,17 @@ CORE_OS_HTML = """<!DOCTYPE html>
                     </div>
                 `;
             } catch (e) {
-                content.innerHTML = '<div class="empty-state">Error loading actions</div>';
+                content.innerHTML = '<div class="empty-state">Error loading actions: ' + escapeHtml(e.message) + '</div>';
             }
         }
 
         function changeActionsFilter() {
             actionsStatusFilter = document.getElementById('action-status-filter').value;
+            loadActions();
+        }
+
+        function toggleCreatedByMeFilter() {
+            actionsCreatedByMeFilter = document.getElementById('created-by-me-filter').checked;
             loadActions();
         }
 
@@ -1180,9 +1287,15 @@ CORE_OS_HTML = """<!DOCTYPE html>
             content.innerHTML = '<div class="empty-state">Loading...</div>';
 
             try {
-                const res = await fetch('/v1/billing/usage', { headers: getHeaders() });
-                if (!res.ok) throw new Error();
-                const data = await res.json();
+                const { res, data, ok } = await apiFetch('/v1/billing/usage', { headers: getHeaders() });
+                if (!ok) throw new Error(data.detail || 'Failed to load billing data');
+
+                const credits = data.credits;
+                const plan = data.plan;
+
+                // Filter breakdown to show action_* events prominently
+                const actionEvents = data.breakdown.filter(b => b.event_key.startsWith('action_'));
+                const otherEvents = data.breakdown.filter(b => !b.event_key.startsWith('action_'));
 
                 content.innerHTML = `
                     <div class="card">
@@ -1190,21 +1303,43 @@ CORE_OS_HTML = """<!DOCTYPE html>
                             <h2>Billing Usage</h2>
                             <button class="btn btn-secondary" onclick="loadBilling()">Refresh</button>
                         </div>
+                        <div style="margin-bottom:15px;font-size:13px;color:#666;">
+                            <strong>Plan:</strong> ${plan.name} |
+                            <strong>Period:</strong> ${data.period_start} to ${data.period_end}
+                        </div>
                         <div style="display:flex;gap:30px;margin-bottom:20px;">
                             <div>
-                                <div style="font-size:24px;font-weight:bold;">${data.included_credits}</div>
+                                <div style="font-size:24px;font-weight:bold;">${credits.included}</div>
                                 <div style="font-size:12px;color:#666;">Included Credits</div>
                             </div>
                             <div>
-                                <div style="font-size:24px;font-weight:bold;color:#0066cc;">${data.total_credits_used.toFixed(2)}</div>
+                                <div style="font-size:24px;font-weight:bold;color:#0066cc;">${credits.used.toFixed(2)}</div>
                                 <div style="font-size:12px;color:#666;">Credits Used</div>
                             </div>
                             <div>
-                                <div style="font-size:24px;font-weight:bold;color:#00aa00;">${data.remaining_credits.toFixed(2)}</div>
+                                <div style="font-size:24px;font-weight:bold;color:#00aa00;">${credits.remaining.toFixed(2)}</div>
                                 <div style="font-size:12px;color:#666;">Remaining</div>
                             </div>
+                            ${credits.overage_credits > 0 ? `<div>
+                                <div style="font-size:24px;font-weight:bold;color:#cc0000;">${credits.overage_credits.toFixed(2)}</div>
+                                <div style="font-size:12px;color:#666;">Overage (~$${credits.estimated_overage_cost.toFixed(2)})</div>
+                            </div>` : ''}
                         </div>
-                        <h3 style="font-size:14px;margin-bottom:10px;">Usage Breakdown</h3>
+
+                        ${actionEvents.length ? `
+                            <h3 style="font-size:14px;margin-bottom:10px;">Action Center Usage</h3>
+                            <table style="margin-bottom:20px;">
+                                <tr><th>Event Type</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>
+                                ${actionEvents.map(b => `<tr>
+                                    <td>${b.event_key}</td>
+                                    <td>${b.raw_units}</td>
+                                    <td>${b.credits.toFixed(2)}</td>
+                                    <td>$${b.list_cost_estimate.toFixed(4)}</td>
+                                </tr>`).join('')}
+                            </table>
+                        ` : ''}
+
+                        <h3 style="font-size:14px;margin-bottom:10px;">All Usage Breakdown</h3>
                         ${data.breakdown.length ? `<table>
                             <tr><th>Event Type</th><th>Raw Units</th><th>Credits</th><th>Est. Cost</th></tr>
                             ${data.breakdown.map(b => `<tr>
@@ -1217,7 +1352,7 @@ CORE_OS_HTML = """<!DOCTYPE html>
                     </div>
                 `;
             } catch (e) {
-                content.innerHTML = '<div class="empty-state">Error loading billing data</div>';
+                content.innerHTML = '<div class="empty-state">Error loading billing data: ' + escapeHtml(e.message) + '</div>';
             }
         }
 
@@ -1274,30 +1409,76 @@ CORE_OS_HTML = """<!DOCTYPE html>
         // Create forms
         function showCreateAction() {
             openModal('Create Action', `
-                <div class="form-group"><label>Title</label><input type="text" id="action-title"></div>
-                <div class="form-group"><label>Description</label><textarea id="action-description"></textarea></div>
+                <div class="form-group"><label>Title *</label><input type="text" id="action-title" placeholder="Action title (required)"></div>
+                <div class="form-group"><label>Description</label><textarea id="action-description" placeholder="Optional description"></textarea></div>
                 <div class="form-row">
-                    <div class="form-group"><label>Type</label><input type="text" id="action-type" value="general"></div>
-                    <div class="form-group"><label>Source</label><select id="action-source"><option>user</option><option>agent</option><option>system</option></select></div>
+                    <div class="form-group"><label>Action Type *</label><input type="text" id="action-type" value="general" placeholder="e.g., outreach, update, create"></div>
+                    <div class="form-group"><label>Source</label><select id="action-source"><option value="user">user</option><option value="agent">agent</option><option value="system">system</option></select></div>
                 </div>
-                <button class="btn" onclick="createAction()">Create</button>
+                <div class="form-row">
+                    <div class="form-group"><label>Assigned To User ID</label><input type="text" id="action-assigned" placeholder="Optional user ID"></div>
+                    <div class="form-group"><label>Source Ref</label><input type="text" id="action-source-ref" placeholder="Optional reference"></div>
+                </div>
+                <div class="form-group">
+                    <label>Payload (JSON)</label>
+                    <textarea id="action-payload" style="font-family:monospace;min-height:100px;" placeholder='{"key": "value"}'>{}</textarea>
+                    <div id="action-payload-error" style="color:#cc0000;font-size:11px;display:none;"></div>
+                </div>
+                <button class="btn" onclick="createAction()">Create Action</button>
             `);
         }
 
         async function createAction() {
-            const body = {
-                title: document.getElementById('action-title').value,
-                description: document.getElementById('action-description').value,
-                action_type: document.getElementById('action-type').value,
-                source: document.getElementById('action-source').value,
-                payload: {}
-            };
+            const title = document.getElementById('action-title').value.trim();
+            const actionType = document.getElementById('action-type').value.trim();
+            const payloadText = document.getElementById('action-payload').value.trim();
+            const payloadError = document.getElementById('action-payload-error');
+
+            if (!title) {
+                alert('Title is required');
+                return;
+            }
+            if (!actionType) {
+                alert('Action type is required');
+                return;
+            }
+
+            let payload = {};
             try {
-                const res = await fetch('/v1/actions', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                payload = JSON.parse(payloadText || '{}');
+                payloadError.style.display = 'none';
+            } catch (e) {
+                payloadError.textContent = 'Invalid JSON: ' + e.message;
+                payloadError.style.display = 'block';
+                return;
+            }
+
+            const body = {
+                title: title,
+                description: document.getElementById('action-description').value || null,
+                action_type: actionType,
+                source: document.getElementById('action-source').value,
+                source_ref: document.getElementById('action-source-ref').value || null,
+                assigned_to_user_id: document.getElementById('action-assigned').value || null,
+                payload: payload
+            };
+
+            try {
+                const { res, data, ok } = await apiFetch('/v1/actions', {
+                    method: 'POST',
+                    headers: getHeaders(),
+                    body: JSON.stringify(body)
+                });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
                 closeModal();
                 loadActions();
-            } catch (e) { alert('Error: ' + e.message); }
+                // Open the newly created action in detail view
+                setTimeout(() => viewActionDetail(data.action_id), 100);
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
 
         function showCreateTask() {
@@ -1405,62 +1586,155 @@ CORE_OS_HTML = """<!DOCTYPE html>
             } catch (e) { alert('Error: ' + e.message); }
         }
 
-        // Action operations
-        async function approveAction(id) {
-            if (!confirm('Approve this action?')) return;
-            try {
-                const res = await fetch('/v1/actions/' + id + '/approve', { method: 'POST', headers: getHeaders(), body: '{}' });
-                if (!res.ok) throw new Error((await res.json()).detail);
-                loadActions();
-            } catch (e) { alert('Error: ' + e.message); }
+        // Action operations - Dialog versions with comment/form inputs
+        function showApproveDialog(id) {
+            openModal('Approve Action', `
+                <p style="margin-bottom:15px;">Approve this action?</p>
+                <div class="form-group">
+                    <label>Comment (optional)</label>
+                    <textarea id="approve-comment" placeholder="Add an optional comment for the approval"></textarea>
+                </div>
+                <div style="display:flex;gap:10px;">
+                    <button class="btn btn-success" onclick="doApproveAction('${id}')">Approve</button>
+                    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            `);
         }
 
-        async function rejectAction(id) {
-            if (!confirm('Reject this action?')) return;
+        async function doApproveAction(id) {
+            const comment = document.getElementById('approve-comment').value || null;
             try {
-                const res = await fetch('/v1/actions/' + id + '/reject', { method: 'POST', headers: getHeaders(), body: '{}' });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                const { res, data, ok } = await apiFetch('/v1/actions/' + id + '/approve', {
+                    method: 'POST',
+                    headers: getHeaders(),
+                    body: JSON.stringify({ comment: comment })
+                });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
+                closeModal();
                 loadActions();
-            } catch (e) { alert('Error: ' + e.message); }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
 
-        async function executeAction(id) {
-            const resultInput = prompt('Enter execution result (JSON, leave empty for {}):');
+        function showRejectDialog(id) {
+            openModal('Reject Action', `
+                <p style="margin-bottom:15px;">Reject this action?</p>
+                <div class="form-group">
+                    <label>Comment (optional)</label>
+                    <textarea id="reject-comment" placeholder="Add an optional comment for the rejection"></textarea>
+                </div>
+                <div style="display:flex;gap:10px;">
+                    <button class="btn btn-danger" onclick="doRejectAction('${id}')">Reject</button>
+                    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            `);
+        }
+
+        async function doRejectAction(id) {
+            const comment = document.getElementById('reject-comment').value || null;
+            try {
+                const { res, data, ok } = await apiFetch('/v1/actions/' + id + '/reject', {
+                    method: 'POST',
+                    headers: getHeaders(),
+                    body: JSON.stringify({ comment: comment })
+                });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
+                closeModal();
+                loadActions();
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
+        function showExecuteDialog(id) {
+            openModal('Execute Action', `
+                <p style="margin-bottom:15px;">Execute this action</p>
+                <div class="form-group">
+                    <label>Execution Status *</label>
+                    <select id="execute-status">
+                        <option value="succeeded" selected>succeeded</option>
+                        <option value="failed">failed</option>
+                        <option value="skipped">skipped</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Result (JSON)</label>
+                    <textarea id="execute-result" style="font-family:monospace;min-height:100px;" placeholder='{"key": "value"}'>{}</textarea>
+                    <div id="execute-result-error" style="color:#cc0000;font-size:11px;display:none;"></div>
+                </div>
+                <div style="display:flex;gap:10px;">
+                    <button class="btn" onclick="doExecuteAction('${id}')">Execute</button>
+                    <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                </div>
+            `);
+        }
+
+        async function doExecuteAction(id) {
+            const execStatus = document.getElementById('execute-status').value;
+            const resultText = document.getElementById('execute-result').value.trim();
+            const resultError = document.getElementById('execute-result-error');
+
             let result = {};
-            if (resultInput) {
-                try { result = JSON.parse(resultInput); } catch(e) { alert('Invalid JSON'); return; }
-            }
-            const execStatus = prompt('Execution status (succeeded/failed/skipped):', 'succeeded');
-            if (!execStatus || !['succeeded','failed','skipped'].includes(execStatus)) {
-                alert('Invalid execution status'); return;
-            }
             try {
-                const res = await fetch('/v1/actions/' + id + '/execute', {
-                    method: 'POST', headers: getHeaders(),
+                result = JSON.parse(resultText || '{}');
+                resultError.style.display = 'none';
+            } catch (e) {
+                resultError.textContent = 'Invalid JSON: ' + e.message;
+                resultError.style.display = 'block';
+                return;
+            }
+
+            try {
+                const { res, data, ok } = await apiFetch('/v1/actions/' + id + '/execute', {
+                    method: 'POST',
+                    headers: getHeaders(),
                     body: JSON.stringify({ execution_status: execStatus, result: result })
                 });
-                if (!res.ok) {
-                    const errData = await res.json();
-                    throw new Error(typeof errData.detail === 'string' ? errData.detail : JSON.stringify(errData.detail));
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
                 }
+                closeModal();
                 loadActions();
-            } catch (e) { alert('Error: ' + e.message); }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
 
         async function cancelAction(id) {
             if (!confirm('Cancel this action?')) return;
             try {
-                const res = await fetch('/v1/actions/' + id + '/cancel', { method: 'POST', headers: getHeaders(), body: '{}' });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                const { res, data, ok } = await apiFetch('/v1/actions/' + id + '/cancel', {
+                    method: 'POST',
+                    headers: getHeaders(),
+                    body: '{}'
+                });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
                 loadActions();
-            } catch (e) { alert('Error: ' + e.message); }
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
         }
+
+        // Legacy function names for backwards compatibility with detail view buttons
+        function approveAction(id) { showApproveDialog(id); }
+        function rejectAction(id) { showRejectDialog(id); }
+        function executeAction(id) { showExecuteDialog(id); }
 
         async function viewActionDetail(id) {
             try {
-                const res = await fetch('/v1/actions/' + id, { headers: getHeaders() });
-                if (!res.ok) throw new Error();
-                const a = await res.json();
+                const { res, data: a, ok } = await apiFetch('/v1/actions/' + id, { headers: getHeaders() });
+                if (!ok) throw new Error(a.detail || 'Failed to load action');
+
+                const isAdmin = userRole === 'admin';
+                const currentUserId = document.getElementById('user-id').value;
+                const canCancel = a.status === 'proposed' && (isAdmin || a.created_by_user_id === currentUserId);
 
                 let body = `
                     <div class="detail-section">
@@ -1469,7 +1743,7 @@ CORE_OS_HTML = """<!DOCTYPE html>
                         <p><strong>Title:</strong> ${escapeHtml(a.title)}</p>
                         <p><strong>Status:</strong> <span class="status-badge status-${a.status}">${a.status}</span></p>
                         <p><strong>Type:</strong> ${a.action_type}</p>
-                        <p><strong>Source:</strong> ${a.source}</p>
+                        <p><strong>Source:</strong> ${a.source}${a.source_ref ? ' (ref: ' + escapeHtml(a.source_ref) + ')' : ''}</p>
                         <p><strong>Description:</strong> ${escapeHtml(a.description || '-')}</p>
                         <p><strong>Created By:</strong> ${a.created_by_user_id}</p>
                         <p><strong>Assigned To:</strong> ${a.assigned_to_user_id || '-'}</p>
@@ -1492,6 +1766,13 @@ CORE_OS_HTML = """<!DOCTYPE html>
                             <p><strong>Time:</strong> ${a.review.created_at}</p>
                         </div>
                     `;
+                } else if (a.status === 'proposed') {
+                    body += `
+                        <div class="detail-section" style="border-top:1px solid #eee;padding-top:15px;">
+                            <h4>Review</h4>
+                            <p style="color:#999;">Pending review</p>
+                        </div>
+                    `;
                 }
 
                 if (a.execution) {
@@ -1506,25 +1787,33 @@ CORE_OS_HTML = """<!DOCTYPE html>
                             <pre>${JSON.stringify(a.execution.result, null, 2)}</pre>
                         </div>
                     `;
+                } else if (a.status === 'approved') {
+                    body += `
+                        <div class="detail-section" style="border-top:1px solid #eee;padding-top:15px;">
+                            <h4>Execution</h4>
+                            <p style="color:#999;">Pending execution</p>
+                        </div>
+                    `;
                 }
 
                 // Add action buttons based on status
-                const isAdmin = userRole === 'admin';
                 body += '<div style="margin-top:20px;display:flex;gap:10px;">';
                 if (a.status === 'proposed' && isAdmin) {
-                    body += `<button class="btn btn-success" onclick="closeModal();approveAction('${a.action_id}')">Approve</button>`;
-                    body += `<button class="btn btn-danger" onclick="closeModal();rejectAction('${a.action_id}')">Reject</button>`;
+                    body += `<button class="btn btn-success" onclick="closeModal();showApproveDialog('${a.action_id}')">Approve</button>`;
+                    body += `<button class="btn btn-danger" onclick="closeModal();showRejectDialog('${a.action_id}')">Reject</button>`;
                 }
-                if (a.status === 'proposed') {
+                if (canCancel) {
                     body += `<button class="btn btn-secondary" onclick="closeModal();cancelAction('${a.action_id}')">Cancel</button>`;
                 }
                 if (a.status === 'approved' && isAdmin) {
-                    body += `<button class="btn" onclick="closeModal();executeAction('${a.action_id}')">Execute</button>`;
+                    body += `<button class="btn" onclick="closeModal();showExecuteDialog('${a.action_id}')">Execute</button>`;
                 }
                 body += '</div>';
 
                 openModal('Action: ' + escapeHtml(a.title), body);
-            } catch (e) { alert('Error loading action details'); }
+            } catch (e) {
+                alert('Error loading action details: ' + e.message);
+            }
         }
 
         async function completeTask(id) {

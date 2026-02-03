@@ -2261,3 +2261,30 @@ class TestMeEndpoint:
         data = response.json()
         assert data["role"] == "member"
         assert data["email"] == "member-a@test.com"
+
+    def test_me_cross_tenant_user_returns_403(self, client, tenant_a, member_a, tenant_b):
+        """GET /v1/me with cross-tenant user_id returns 403."""
+        # Try to use tenant B's API key with tenant A's user_id
+        cross_tenant_headers = {
+            "X-Tenant-ID": tenant_b["tenant_id"],
+            "X-User-ID": member_a["user_id"],  # User from tenant A
+            "X-API-Key": tenant_b["api_key"],  # API key from tenant B
+        }
+        response = client.get("/v1/me", headers=cross_tenant_headers)
+        # Should fail because user doesn't belong to tenant B
+        assert response.status_code == 403
+
+    def test_me_invalid_api_key_returns_401(self, client, tenant_a):
+        """GET /v1/me with invalid API key returns 401."""
+        invalid_headers = {
+            "X-Tenant-ID": tenant_a["tenant_id"],
+            "X-User-ID": tenant_a["admin"]["user_id"],
+            "X-API-Key": "invalid-api-key",
+        }
+        response = client.get("/v1/me", headers=invalid_headers)
+        assert response.status_code == 401
+
+    def test_me_missing_headers_returns_400(self, client):
+        """GET /v1/me with missing headers returns 400."""
+        response = client.get("/v1/me", headers={})
+        assert response.status_code == 400
