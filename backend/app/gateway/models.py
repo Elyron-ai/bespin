@@ -365,6 +365,8 @@ class ActionReview(Base):
     created_at = Column(String(30), nullable=False)  # ISO 8601
 
     __table_args__ = (
+        # Only one review per action (v0 - exactly one decision)
+        UniqueConstraint("tenant_id", "action_id", name="uq_action_review_tenant_action"),
         Index("ix_action_reviews_tenant_action_created", "tenant_id", "action_id", "created_at"),
     )
 
