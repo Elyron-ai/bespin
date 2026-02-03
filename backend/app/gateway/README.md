@@ -310,3 +310,135 @@ Currently implemented roles:
 - **Idempotency**: Uses SHA-256 hash of canonical JSON to detect body changes
 - **Tool Registry**: In-process registry with decorator-based registration
 - **Audit/Usage**: Written transactionally after successful tool execution
+
+---
+
+## Tasks v0 API (Phase 1 Task 9a)
+
+Tasks v0 provides tenant-scoped task management with RBAC, metering, and audit logging.
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | /v1/tasks | Create a new task |
+| GET | /v1/tasks | List tasks with filters |
+| GET | /v1/tasks/{task_id} | Get a single task |
+| PATCH | /v1/tasks/{task_id} | Update a task |
+| POST | /v1/tasks/{task_id}/complete | Mark task as complete |
+
+### Required Headers
+
+All endpoints require:
+- `X-Tenant-ID`: Tenant UUID
+- `X-User-ID`: User UUID
+- `X-API-Key`: Tenant API key
+
+### Create Task
+
+```bash
+curl -X POST http://localhost:8000/v1/tasks \
+  -H "Content-Type: application/json" \
+  -H "X-Tenant-ID: <tenant_id>" \
+  -H "X-User-ID: <user_id>" \
+  -H "X-API-Key: <api_key>" \
+  -d '{
+    "title": "Review Q4 Report",
+    "description": "Analyze metrics",
+    "priority": "high",
+    "due_date": "2024-12-31",
+    "assigned_to_user_id": "<user_id>",
+    "linked_entity_type": "action",
+    "linked_entity_id": "<action_id>"
+  }'
+```
+
+Response:
+```json
+{
+  "task_id": "...",
+  "tenant_id": "...",
+  "created_by_user_id": "...",
+  "assigned_to_user_id": "...",
+  "status": "todo",
+  "priority": "high",
+  "due_date": "2024-12-31",
+  "title": "Review Q4 Report",
+  "description": "Analyze metrics",
+  "linked_entity_type": "action",
+  "linked_entity_id": "...",
+  "created_at": "...",
+  "updated_at": "..."
+}
+```
+
+### List Tasks
+
+```bash
+# Default: status=todo
+curl -X GET "http://localhost:8000/v1/tasks" ...
+
+# With filters
+curl -X GET "http://localhost:8000/v1/tasks?status=all&assigned_to_user_id=<id>&created_by_user_id=<id>&due_before=2024-12-31&due_after=2024-01-01&limit=50&offset=0" ...
+```
+
+Query parameters:
+- `status`: todo | doing | done | all (default: todo)
+- `assigned_to_user_id`: Filter by assignee
+- `created_by_user_id`: Filter by creator
+- `due_before`: YYYY-MM-DD
+- `due_after`: YYYY-MM-DD
+- `limit`: 1-200 (default: 50)
+- `offset`: >= 0
+
+### RBAC Rules
+
+**Create/List/Get:**
+- Member and Admin allowed
+
+**Update (PATCH):**
+- Member: only if creator OR assignee
+- Admin: always allowed
+
+**Complete:**
+- Member: only if creator OR assignee
+- Admin: always allowed
+
+### Metered Events
+
+| Event Key | Unit | Credits/Unit | When Emitted |
+|-----------|------|--------------|--------------|
+| task_created | record | 0.1 | Task created |
+| task_updated | record | 0.05 | Task updated (with changes) |
+| task_completed | event | 0.05 | Task marked complete |
+
+### Idempotency
+
+- Completing an already-done task returns 200 without emitting usage/audit
+- Updating with no changes returns 200 without emitting usage/audit
+
+### Cross-Tenant Security
+
+- Accessing a task from another tenant returns 404 (not 403) to avoid leaking existence
+
+### Run Smoke Test
+
+```bash
+./scripts/smoke_phase1_task9a_tasks_v0.sh
+```
+
+### Test via Playground UI
+
+1. Start the server
+2. Navigate to http://localhost:8000/ui
+3. Enter credentials (Tenant ID, User ID, API Key)
+4. Click "Tasks" in the left navigation
+5. Use filters (status, assigned to me, created by me)
+6. Create, edit, and complete tasks
+
+### Run Tests
+
+```bash
+cd backend
+PYTHONPATH=. pytest tests/test_core_os.py -v -k "Tasks"
+```

@@ -174,6 +174,8 @@ class TaskUpdate(BaseModel):
     priority: str | None = Field(None, pattern="^(low|medium|high)$")
     due_date: str | None = Field(None, pattern="^\\d{4}-\\d{2}-\\d{2}$")
     status: str | None = Field(None, pattern="^(todo|doing|done)$")
+    linked_entity_type: str | None = None
+    linked_entity_id: str | None = None
 
 
 class TaskResponse(BaseModel):
@@ -1270,23 +1272,40 @@ def create_task(
 def list_tasks(
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
-    status_filter: str | None = Query(None, alias="status"),
+    status_filter: str | None = Query("todo", alias="status"),
     assigned_to_user_id: str | None = None,
+    created_by_user_id: str | None = None,
     due_before: str | None = None,
-    limit: int = Query(50, ge=1, le=100),
+    due_after: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ) -> TaskListResponse:
-    """List tasks for the tenant."""
+    """List tasks for the tenant.
+
+    Args:
+        status: Filter by status (todo, doing, done, all). Default: todo.
+        assigned_to_user_id: Filter by assignee.
+        created_by_user_id: Filter by creator.
+        due_before: Filter tasks due on or before this date (YYYY-MM-DD).
+        due_after: Filter tasks due on or after this date (YYYY-MM-DD).
+        limit: Max results (1-200). Default: 50.
+        offset: Skip results for pagination.
+    """
     check_entitlement(db, context.tenant_id, "tasks")
 
     query = db.query(Task).filter(Task.tenant_id == context.tenant_id)
 
-    if status_filter:
+    # Filter by status (default "todo", "all" returns everything)
+    if status_filter and status_filter != "all":
         query = query.filter(Task.status == status_filter)
     if assigned_to_user_id:
         query = query.filter(Task.assigned_to_user_id == assigned_to_user_id)
+    if created_by_user_id:
+        query = query.filter(Task.created_by_user_id == created_by_user_id)
     if due_before:
         query = query.filter(Task.due_date <= due_before)
+    if due_after:
+        query = query.filter(Task.due_date >= due_after)
 
     total = query.count()
     tasks = query.order_by(Task.due_date.asc().nullslast(), Task.created_at.desc()).offset(offset).limit(limit).all()
@@ -1373,13 +1392,27 @@ def update_task(
     return TaskResponse.model_validate(task)
 
 
+class TaskComplete(BaseModel):
+    """Request schema for completing a task (optional body)."""
+    comment: str | None = None  # Placeholder for future use
+
+
 @router.post("/tasks/{task_id}/complete", response_model=TaskResponse)
 def complete_task(
     task_id: str,
     context: Annotated[TenantContext, Depends(get_tenant_context)],
     db: Session = Depends(get_db),
+    complete_data: TaskComplete | None = None,
 ) -> TaskResponse:
-    """Mark a task as complete."""
+    """Mark a task as complete.
+
+    RBAC Rules:
+    - Creator can complete their own task.
+    - Assignee can complete tasks assigned to them.
+    - Admin can complete any task in the tenant.
+
+    Idempotent: If task is already done, returns 200 without emitting usage/audit.
+    """
     request_id = str(uuid.uuid4())
     check_entitlement(db, context.tenant_id, "tasks")
 
@@ -1391,13 +1424,15 @@ def complete_task(
     if not task:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
 
-    # RBAC: assignee or admin can complete
+    # RBAC: creator, assignee, or admin can complete
     is_admin = context.user.role == "admin"
+    is_creator = task.created_by_user_id == context.user_id
     is_assignee = task.assigned_to_user_id == context.user_id
 
-    if not (is_admin or is_assignee):
+    if not (is_admin or is_creator or is_assignee):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to complete this task")
 
+    # Idempotent: if already done, return without new writes
     if task.status == "done":
         return TaskResponse.model_validate(task)
 

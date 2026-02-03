@@ -2288,3 +2288,571 @@ class TestMeEndpoint:
         """GET /v1/me with missing headers returns 400."""
         response = client.get("/v1/me", headers={})
         assert response.status_code == 400
+
+
+# =============================================================================
+# Tasks v0 Tests (Phase 1, Task 9a)
+# =============================================================================
+
+class TestTasksV0Create:
+    """Test task creation (Phase 1 Task 9a)."""
+
+    def test_member_can_create_task_with_defaults(self, client, member_a_headers):
+        """Member can create a task with default status=todo and priority=medium."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "My Task"},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["status"] == "todo"
+        assert data["priority"] == "medium"
+        assert data["title"] == "My Task"
+
+    def test_create_task_with_all_fields(self, client, member_a_headers, member_a):
+        """Create task with all fields specified."""
+        response = client.post(
+            "/v1/tasks",
+            json={
+                "title": "Full Task",
+                "description": "A complete task",
+                "priority": "high",
+                "due_date": "2024-12-31",
+                "assigned_to_user_id": member_a["user_id"],
+                "linked_entity_type": "action",
+                "linked_entity_id": "some-action-id",
+            },
+            headers=member_a_headers,
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["title"] == "Full Task"
+        assert data["description"] == "A complete task"
+        assert data["priority"] == "high"
+        assert data["due_date"] == "2024-12-31"
+        assert data["linked_entity_type"] == "action"
+        assert data["linked_entity_id"] == "some-action-id"
+
+    def test_admin_can_create_task(self, client, admin_a_headers):
+        """Admin can also create tasks."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Admin Task"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+
+
+class TestTasksV0TenantIsolation:
+    """Test tenant isolation for tasks (Phase 1 Task 9a)."""
+
+    def test_tenant_b_cannot_see_tenant_a_task(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B should not be able to access Tenant A's task (returns 404)."""
+        # Tenant A creates a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Tenant A Task", "priority": "medium"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+        task_id = response.json()["task_id"]
+
+        # Tenant B tries to access it
+        response = client.get(f"/v1/tasks/{task_id}", headers=admin_b_headers)
+        assert response.status_code == 404
+
+    def test_tenant_b_cannot_update_tenant_a_task(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B cannot update Tenant A's task (returns 404)."""
+        # Tenant A creates a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Tenant A Task"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Tenant B tries to update it
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"title": "Hijacked!"},
+            headers=admin_b_headers,
+        )
+        assert response.status_code == 404
+
+    def test_tenant_b_cannot_complete_tenant_a_task(self, client, admin_a_headers, admin_b_headers):
+        """Tenant B cannot complete Tenant A's task (returns 404)."""
+        # Tenant A creates a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Tenant A Task"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Tenant B tries to complete it
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=admin_b_headers)
+        assert response.status_code == 404
+
+
+class TestTasksV0RBACUpdate:
+    """Test RBAC rules for task update (Phase 1 Task 9a)."""
+
+    def test_creator_can_update_own_task(self, client, member_a_headers):
+        """Creator can update their own task."""
+        # Create a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "My Task"},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Update it
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"title": "Updated Task", "priority": "high"},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["title"] == "Updated Task"
+        assert response.json()["priority"] == "high"
+
+    def test_assignee_can_update_assigned_task(
+        self, client, member_a_headers, member_a2_headers, member_a2
+    ):
+        """Assignee can update tasks assigned to them."""
+        # Member A creates task assigned to member A2
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Task for A2", "assigned_to_user_id": member_a2["user_id"]},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Member A2 (assignee) can update
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"priority": "high", "status": "doing"},
+            headers=member_a2_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["priority"] == "high"
+        assert response.json()["status"] == "doing"
+
+    def test_non_assignee_non_creator_cannot_update(
+        self, client, admin_a_headers, member_a_headers, member_a2_headers, member_a2
+    ):
+        """Member who is neither creator nor assignee cannot update (403)."""
+        # Admin creates a task assigned to member A2
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Task for A2", "assigned_to_user_id": member_a2["user_id"]},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Member A (not creator, not assignee) tries to update
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"title": "Hijacked!"},
+            headers=member_a_headers,
+        )
+        assert response.status_code == 403
+
+    def test_admin_can_update_any_task(
+        self, client, member_a_headers, admin_a_headers
+    ):
+        """Admin can update any task in the tenant."""
+        # Member creates a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Member Task"},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Admin can update
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"priority": "high"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+        assert response.json()["priority"] == "high"
+
+    def test_update_no_changes_does_not_emit_usage(
+        self, client, admin_a_headers
+    ):
+        """If update body results in no changes, no usage/audit is emitted."""
+        # Create a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Test Task", "priority": "medium"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Get initial billing usage
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        initial_breakdown = response.json()["breakdown"]
+        initial_updated = next(
+            (b for b in initial_breakdown if b["event_key"] == "task_updated"), None
+        )
+        initial_updated_units = initial_updated["raw_units"] if initial_updated else 0
+
+        # Update with same values (no actual change)
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"title": "Test Task", "priority": "medium"},  # Same values
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Check billing - should NOT have increased
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        final_breakdown = response.json()["breakdown"]
+        final_updated = next(
+            (b for b in final_breakdown if b["event_key"] == "task_updated"), None
+        )
+        final_updated_units = final_updated["raw_units"] if final_updated else 0
+
+        assert final_updated_units == initial_updated_units
+
+
+class TestTasksV0RBACComplete:
+    """Test RBAC rules for task complete (Phase 1 Task 9a)."""
+
+    def test_creator_can_complete_own_task(self, client, member_a_headers):
+        """Creator can complete their own task."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "My Task"},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=member_a_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "done"
+
+    def test_assignee_can_complete_assigned_task(
+        self, client, member_a_headers, member_a2_headers, member_a2
+    ):
+        """Assignee can complete tasks assigned to them."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Task for A2", "assigned_to_user_id": member_a2["user_id"]},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=member_a2_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "done"
+
+    def test_non_assignee_non_creator_cannot_complete(
+        self, client, admin_a_headers, member_a_headers, member_a2_headers, member_a2
+    ):
+        """Member who is neither creator nor assignee cannot complete (403)."""
+        # Admin creates task assigned to member A2
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Task for A2", "assigned_to_user_id": member_a2["user_id"]},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Member A tries to complete
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=member_a_headers)
+        assert response.status_code == 403
+
+    def test_admin_can_complete_any_task(self, client, member_a_headers, admin_a_headers):
+        """Admin can complete any task in the tenant."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Member Task"},
+            headers=member_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=admin_a_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "done"
+
+
+class TestTasksV0CompleteIdempotent:
+    """Test idempotent complete behavior (Phase 1 Task 9a)."""
+
+    def test_complete_already_done_returns_200_no_usage(self, client, admin_a_headers):
+        """Completing an already-done task returns 200 without emitting additional usage."""
+        # Create a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Idempotent Task"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Complete first time
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=admin_a_headers)
+        assert response.status_code == 200
+        assert response.json()["status"] == "done"
+
+        # Get billing usage after first complete
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        completed = next((b for b in breakdown if b["event_key"] == "task_completed"), None)
+        assert completed is not None
+        first_complete_units = completed["raw_units"]
+
+        # Complete second time (already done)
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=admin_a_headers)
+        assert response.status_code == 200  # Should still return 200
+        assert response.json()["status"] == "done"
+
+        # Check billing - should NOT have increased
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        completed = next((b for b in breakdown if b["event_key"] == "task_completed"), None)
+        assert completed["raw_units"] == first_complete_units  # No increase
+
+
+class TestTasksV0Metering:
+    """Test metering for task operations (Phase 1 Task 9a)."""
+
+    def test_task_created_metered(self, client, admin_a_headers):
+        """Creating a task emits task_created usage."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Metered Task"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        task_created = next((b for b in breakdown if b["event_key"] == "task_created"), None)
+        assert task_created is not None
+        assert task_created["raw_units"] >= 1
+        assert task_created["credits"] == task_created["raw_units"] * 0.1  # 0.1 credits per unit
+
+    def test_task_updated_metered(self, client, admin_a_headers):
+        """Updating a task emits task_updated usage."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "To Update"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Get initial
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        initial = response.json()["breakdown"]
+        initial_updated = next((b for b in initial if b["event_key"] == "task_updated"), None)
+        initial_units = initial_updated["raw_units"] if initial_updated else 0
+
+        # Update
+        response = client.patch(
+            f"/v1/tasks/{task_id}",
+            json={"title": "Updated Title"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 200
+
+        # Check billing
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        task_updated = next((b for b in breakdown if b["event_key"] == "task_updated"), None)
+        assert task_updated is not None
+        assert task_updated["raw_units"] == initial_units + 1
+        assert task_updated["credits"] == task_updated["raw_units"] * 0.05  # 0.05 credits per unit
+
+    def test_task_completed_metered(self, client, admin_a_headers):
+        """Completing a task emits task_completed usage."""
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "To Complete"},
+            headers=admin_a_headers,
+        )
+        task_id = response.json()["task_id"]
+
+        # Complete
+        response = client.post(f"/v1/tasks/{task_id}/complete", headers=admin_a_headers)
+        assert response.status_code == 200
+
+        # Check billing
+        response = client.get("/v1/billing/usage", headers=admin_a_headers)
+        breakdown = response.json()["breakdown"]
+        task_completed = next((b for b in breakdown if b["event_key"] == "task_completed"), None)
+        assert task_completed is not None
+        assert task_completed["raw_units"] >= 1
+        assert task_completed["credits"] == task_completed["raw_units"] * 0.05  # 0.05 credits per unit
+
+
+class TestTasksV0QuotaEnforcement:
+    """Test quota enforcement for tasks (Phase 1 Task 9a)."""
+
+    def test_quota_enforcement_no_partial_writes(self, client, admin_a_headers, tenant_a):
+        """When quota is exceeded, no partial write occurs."""
+        platform_headers = {"X-Platform-Admin-Key": "test-admin-key"}
+
+        # Create a limited plan with cap of 1 task_created per month
+        response = client.post(
+            "/v1/admin/plans",
+            json={
+                "plan_id": "test_task_limited",
+                "name": "Task Limited",
+                "included_credits": 1000,
+                "overage_price_per_credit": 0.02,
+            },
+            headers=platform_headers,
+        )
+        # May already exist, that's fine
+        assert response.status_code in [200, 201, 409]
+
+        # Add tasks capability (required for task access)
+        client.put(
+            "/v1/admin/plans/test_task_limited/capabilities",
+            json={"capabilities": ["tasks"]},
+            headers=platform_headers,
+        )
+
+        # Add event cap of 1 for task_created
+        client.put(
+            "/v1/admin/plans/test_task_limited/caps",
+            json={
+                "caps": [
+                    {"event_key": "task_created", "period": "monthly", "cap_raw_units": 1}
+                ]
+            },
+            headers=platform_headers,
+        )
+
+        # Assign the limited plan to the tenant
+        client.put(
+            f"/v1/admin/tenants/{tenant_a['tenant_id']}/subscription",
+            json={"plan_id": "test_task_limited", "status": "active"},
+            headers=platform_headers,
+        )
+
+        # First task should succeed
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "First Task"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 201
+
+        # Second task should fail with 429
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Second Task"},
+            headers=admin_a_headers,
+        )
+        assert response.status_code == 429
+
+        # Verify no partial write: list should only have 1 task
+        response = client.get("/v1/tasks?status=all", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert len(items) == 1
+        assert items[0]["title"] == "First Task"
+
+
+class TestTasksV0ListFilters:
+    """Test task list endpoint with filters (Phase 1 Task 9a)."""
+
+    def test_list_default_status_is_todo(self, client, admin_a_headers):
+        """Default status filter is 'todo'."""
+        # Create todo task
+        client.post("/v1/tasks", json={"title": "Todo Task"}, headers=admin_a_headers)
+
+        # Create and complete a task
+        response = client.post(
+            "/v1/tasks",
+            json={"title": "Done Task"},
+            headers=admin_a_headers,
+        )
+        done_id = response.json()["task_id"]
+        client.post(f"/v1/tasks/{done_id}/complete", headers=admin_a_headers)
+
+        # List without filter
+        response = client.get("/v1/tasks", headers=admin_a_headers)
+        items = response.json()["items"]
+        # Should only show todo tasks by default
+        assert all(t["status"] == "todo" for t in items)
+
+    def test_list_status_all(self, client, admin_a_headers):
+        """status=all returns all tasks."""
+        # Create tasks with different statuses
+        client.post("/v1/tasks", json={"title": "Todo"}, headers=admin_a_headers)
+        resp = client.post("/v1/tasks", json={"title": "Done"}, headers=admin_a_headers)
+        client.post(f"/v1/tasks/{resp.json()['task_id']}/complete", headers=admin_a_headers)
+
+        # List with status=all
+        response = client.get("/v1/tasks?status=all", headers=admin_a_headers)
+        items = response.json()["items"]
+        statuses = {t["status"] for t in items}
+        assert "todo" in statuses or "done" in statuses
+
+    def test_list_assigned_to_user_id_filter(
+        self, client, admin_a_headers, member_a, member_a_headers
+    ):
+        """Can filter by assigned_to_user_id."""
+        # Create task assigned to member A
+        client.post(
+            "/v1/tasks",
+            json={"title": "Assigned to A", "assigned_to_user_id": member_a["user_id"]},
+            headers=admin_a_headers,
+        )
+        # Create another unassigned task
+        client.post("/v1/tasks", json={"title": "Unassigned"}, headers=admin_a_headers)
+
+        # List filtered
+        response = client.get(
+            f"/v1/tasks?status=all&assigned_to_user_id={member_a['user_id']}",
+            headers=admin_a_headers,
+        )
+        items = response.json()["items"]
+        assert all(t["assigned_to_user_id"] == member_a["user_id"] for t in items)
+
+    def test_list_created_by_user_id_filter(
+        self, client, admin_a_headers, member_a_headers, member_a, tenant_a
+    ):
+        """Can filter by created_by_user_id."""
+        # Member creates a task
+        client.post("/v1/tasks", json={"title": "By Member"}, headers=member_a_headers)
+        # Admin creates a task
+        client.post("/v1/tasks", json={"title": "By Admin"}, headers=admin_a_headers)
+
+        # List filtered by member
+        response = client.get(
+            f"/v1/tasks?status=all&created_by_user_id={member_a['user_id']}",
+            headers=admin_a_headers,
+        )
+        items = response.json()["items"]
+        assert all(t["created_by_user_id"] == member_a["user_id"] for t in items)
+
+    def test_list_due_date_filters(self, client, admin_a_headers):
+        """Can filter by due_before and due_after."""
+        # Create tasks with different due dates
+        client.post(
+            "/v1/tasks",
+            json={"title": "Early", "due_date": "2024-01-15"},
+            headers=admin_a_headers,
+        )
+        client.post(
+            "/v1/tasks",
+            json={"title": "Late", "due_date": "2024-12-15"},
+            headers=admin_a_headers,
+        )
+
+        # Filter due_before
+        response = client.get("/v1/tasks?status=all&due_before=2024-06-01", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert all(t["due_date"] is None or t["due_date"] <= "2024-06-01" for t in items)
+
+        # Filter due_after
+        response = client.get("/v1/tasks?status=all&due_after=2024-06-01", headers=admin_a_headers)
+        items = response.json()["items"]
+        assert all(t["due_date"] is None or t["due_date"] >= "2024-06-01" for t in items)

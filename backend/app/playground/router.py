@@ -1054,6 +1054,9 @@ CORE_OS_HTML = """<!DOCTYPE html>
         }
 
         let actionsStatusFilter = 'all';
+        let tasksStatusFilter = 'todo';
+        let tasksAssignedToMeFilter = false;
+        let tasksCreatedByMeFilter = false;
 
         async function loadActions() {
             const content = document.getElementById('content');
@@ -1135,33 +1138,76 @@ CORE_OS_HTML = """<!DOCTYPE html>
             content.innerHTML = '<div class="empty-state">Loading...</div>';
 
             try {
-                const res = await fetch('/v1/tasks?limit=50', { headers: getHeaders() });
-                if (!res.ok) throw new Error();
-                const data = await res.json();
+                let url = '/v1/tasks?status=' + tasksStatusFilter + '&limit=50';
+                if (tasksAssignedToMeFilter) {
+                    url += '&assigned_to_user_id=' + encodeURIComponent(document.getElementById('user-id').value);
+                }
+                if (tasksCreatedByMeFilter) {
+                    url += '&created_by_user_id=' + encodeURIComponent(document.getElementById('user-id').value);
+                }
+                const { res, data, ok } = await apiFetch(url, { headers: getHeaders() });
+                if (!ok) throw new Error(data.detail || 'Failed to load tasks');
+
+                const currentUserId = document.getElementById('user-id').value;
+                const isAdmin = userRole === 'admin';
 
                 content.innerHTML = `
                     <div class="card">
                         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;">
                             <h2>Tasks (${data.total})</h2>
-                            <button class="btn" onclick="showCreateTask()">+ New Task</button>
+                            <div style="display:flex;gap:10px;align-items:center;">
+                                <label style="font-size:12px;display:flex;align-items:center;gap:5px;">
+                                    <input type="checkbox" id="tasks-assigned-to-me" onchange="toggleTasksAssignedToMe()" ${tasksAssignedToMeFilter?'checked':''}>
+                                    Assigned to me
+                                </label>
+                                <label style="font-size:12px;display:flex;align-items:center;gap:5px;">
+                                    <input type="checkbox" id="tasks-created-by-me" onchange="toggleTasksCreatedByMe()" ${tasksCreatedByMeFilter?'checked':''}>
+                                    Created by me
+                                </label>
+                                <select id="tasks-status-filter" onchange="changeTasksFilter()" style="padding:6px;border:1px solid #ddd;border-radius:4px;">
+                                    <option value="all" ${tasksStatusFilter==='all'?'selected':''}>All</option>
+                                    <option value="todo" ${tasksStatusFilter==='todo'?'selected':''}>Todo</option>
+                                    <option value="doing" ${tasksStatusFilter==='doing'?'selected':''}>Doing</option>
+                                    <option value="done" ${tasksStatusFilter==='done'?'selected':''}>Done</option>
+                                </select>
+                                <button class="btn" onclick="showCreateTask()">+ New Task</button>
+                            </div>
                         </div>
                         ${data.items.length ? `<table>
-                            <tr><th>Title</th><th>Status</th><th>Priority</th><th>Due</th><th>Actions</th></tr>
+                            <tr><th>Due</th><th>Status</th><th>Priority</th><th>Title</th><th>Assigned</th><th>ID</th><th>Updated</th><th>Actions</th></tr>
                             ${data.items.map(t => `<tr>
-                                <td><a href="#" onclick="viewTask('${t.task_id}')">${escapeHtml(t.title)}</a></td>
+                                <td>${t.due_date || '-'}</td>
                                 <td><span class="status-badge status-${t.status}">${t.status}</span></td>
                                 <td class="priority-${t.priority}">${t.priority}</td>
-                                <td>${t.due_date || '-'}</td>
-                                <td>
+                                <td><a href="#" onclick="viewTaskDetail('${t.task_id}')">${escapeHtml(t.title)}</a></td>
+                                <td>${t.assigned_to_user_id ? t.assigned_to_user_id.substring(0,8)+'...' : '-'}</td>
+                                <td>${t.task_id.substring(0,8)}...</td>
+                                <td>${t.updated_at.split('T')[0]}</td>
+                                <td class="action-buttons">
                                     ${t.status !== 'done' ? `<button class="btn btn-success" onclick="completeTask('${t.task_id}')" style="padding:4px 8px;font-size:11px;">Complete</button>` : ''}
                                 </td>
                             </tr>`).join('')}
-                        </table>` : '<div class="empty-state">No tasks yet</div>'}
+                        </table>` : '<div class="empty-state">No tasks found</div>'}
                     </div>
                 `;
             } catch (e) {
-                content.innerHTML = '<div class="empty-state">Error loading tasks</div>';
+                content.innerHTML = '<div class="empty-state">Error loading tasks: ' + escapeHtml(e.message) + '</div>';
             }
+        }
+
+        function changeTasksFilter() {
+            tasksStatusFilter = document.getElementById('tasks-status-filter').value;
+            loadTasks();
+        }
+
+        function toggleTasksAssignedToMe() {
+            tasksAssignedToMeFilter = document.getElementById('tasks-assigned-to-me').checked;
+            loadTasks();
+        }
+
+        function toggleTasksCreatedByMe() {
+            tasksCreatedByMeFilter = document.getElementById('tasks-created-by-me').checked;
+            loadTasks();
         }
 
         async function loadDecisions() {
@@ -1483,28 +1529,46 @@ CORE_OS_HTML = """<!DOCTYPE html>
 
         function showCreateTask() {
             openModal('Create Task', `
-                <div class="form-group"><label>Title</label><input type="text" id="task-title"></div>
-                <div class="form-group"><label>Description</label><textarea id="task-description"></textarea></div>
+                <div class="form-group"><label>Title *</label><input type="text" id="task-title" placeholder="Task title (required)"></div>
+                <div class="form-group"><label>Description</label><textarea id="task-description" placeholder="Optional description"></textarea></div>
                 <div class="form-row">
                     <div class="form-group"><label>Priority</label><select id="task-priority"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option></select></div>
                     <div class="form-group"><label>Due Date</label><input type="date" id="task-due"></div>
                 </div>
-                <button class="btn" onclick="createTask()">Create</button>
+                <div class="form-group"><label>Assigned To User ID</label><input type="text" id="task-assigned" placeholder="Optional user ID"></div>
+                <div class="form-row">
+                    <div class="form-group"><label>Linked Entity Type</label><input type="text" id="task-linked-type" placeholder="e.g. action, decision"></div>
+                    <div class="form-group"><label>Linked Entity ID</label><input type="text" id="task-linked-id" placeholder="Optional entity ID"></div>
+                </div>
+                <button class="btn" onclick="createTask()">Create Task</button>
             `);
         }
 
         async function createTask() {
+            const title = document.getElementById('task-title').value.trim();
+            if (!title) {
+                alert('Title is required');
+                return;
+            }
+
             const body = {
-                title: document.getElementById('task-title').value,
-                description: document.getElementById('task-description').value,
+                title: title,
+                description: document.getElementById('task-description').value || null,
                 priority: document.getElementById('task-priority').value,
-                due_date: document.getElementById('task-due').value || null
+                due_date: document.getElementById('task-due').value || null,
+                assigned_to_user_id: document.getElementById('task-assigned').value || null,
+                linked_entity_type: document.getElementById('task-linked-type').value || null,
+                linked_entity_id: document.getElementById('task-linked-id').value || null
             };
             try {
-                const res = await fetch('/v1/tasks', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                const { res, data, ok } = await apiFetch('/v1/tasks', { method: 'POST', headers: getHeaders(), body: JSON.stringify(body) });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
                 closeModal();
                 loadTasks();
+                // Open the newly created task in detail view
+                setTimeout(() => viewTaskDetail(data.task_id), 100);
             } catch (e) { alert('Error: ' + e.message); }
         }
 
@@ -1816,10 +1880,106 @@ CORE_OS_HTML = """<!DOCTYPE html>
             }
         }
 
+        async function viewTaskDetail(id) {
+            try {
+                const { res, data: t, ok } = await apiFetch('/v1/tasks/' + id, { headers: getHeaders() });
+                if (!ok) throw new Error(t.detail || 'Failed to load task');
+
+                const isAdmin = userRole === 'admin';
+                const currentUserId = document.getElementById('user-id').value;
+                const isCreator = t.created_by_user_id === currentUserId;
+                const isAssignee = t.assigned_to_user_id === currentUserId;
+                const canEdit = isAdmin || isCreator || isAssignee;
+                const canComplete = (isAdmin || isCreator || isAssignee) && t.status !== 'done';
+
+                let body = `
+                    <div class="detail-section">
+                        <h4>Task Details</h4>
+                        <p><strong>ID:</strong> ${t.task_id}</p>
+                        <p><strong>Title:</strong> ${escapeHtml(t.title)}</p>
+                        <p><strong>Status:</strong> <span class="status-badge status-${t.status}">${t.status}</span></p>
+                        <p><strong>Priority:</strong> <span class="priority-${t.priority}">${t.priority}</span></p>
+                        <p><strong>Due Date:</strong> ${t.due_date || '-'}</p>
+                        <p><strong>Description:</strong> ${escapeHtml(t.description || '-')}</p>
+                        <p><strong>Created By:</strong> ${t.created_by_user_id}</p>
+                        <p><strong>Assigned To:</strong> ${t.assigned_to_user_id || '-'}</p>
+                        ${t.linked_entity_type ? `<p><strong>Linked:</strong> ${t.linked_entity_type}/${t.linked_entity_id || '-'}</p>` : ''}
+                        <p><strong>Created:</strong> ${t.created_at}</p>
+                        <p><strong>Updated:</strong> ${t.updated_at}</p>
+                    </div>
+                `;
+
+                if (canEdit) {
+                    body += `
+                        <div class="detail-section" style="border-top:1px solid #eee;padding-top:15px;">
+                            <h4>Edit Task</h4>
+                            <div class="form-group"><label>Title</label><input type="text" id="edit-task-title" value="${escapeHtml(t.title)}"></div>
+                            <div class="form-group"><label>Description</label><textarea id="edit-task-description">${escapeHtml(t.description || '')}</textarea></div>
+                            <div class="form-row">
+                                <div class="form-group"><label>Priority</label><select id="edit-task-priority">
+                                    <option value="low" ${t.priority==='low'?'selected':''}>Low</option>
+                                    <option value="medium" ${t.priority==='medium'?'selected':''}>Medium</option>
+                                    <option value="high" ${t.priority==='high'?'selected':''}>High</option>
+                                </select></div>
+                                <div class="form-group"><label>Status</label><select id="edit-task-status">
+                                    <option value="todo" ${t.status==='todo'?'selected':''}>Todo</option>
+                                    <option value="doing" ${t.status==='doing'?'selected':''}>Doing</option>
+                                    <option value="done" ${t.status==='done'?'selected':''}>Done</option>
+                                </select></div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group"><label>Due Date</label><input type="date" id="edit-task-due" value="${t.due_date || ''}"></div>
+                                <div class="form-group"><label>Assigned To</label><input type="text" id="edit-task-assigned" value="${t.assigned_to_user_id || ''}"></div>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                body += '<div style="margin-top:20px;display:flex;gap:10px;">';
+                if (canEdit) {
+                    body += `<button class="btn" onclick="saveTaskChanges('${t.task_id}')">Save Changes</button>`;
+                }
+                if (canComplete) {
+                    body += `<button class="btn btn-success" onclick="closeModal();completeTask('${t.task_id}')">Complete</button>`;
+                }
+                body += '</div>';
+
+                openModal('Task: ' + escapeHtml(t.title), body);
+            } catch (e) {
+                alert('Error loading task details: ' + e.message);
+            }
+        }
+
+        async function saveTaskChanges(id) {
+            const body = {
+                title: document.getElementById('edit-task-title').value,
+                description: document.getElementById('edit-task-description').value || null,
+                priority: document.getElementById('edit-task-priority').value,
+                status: document.getElementById('edit-task-status').value,
+                due_date: document.getElementById('edit-task-due').value || null,
+                assigned_to_user_id: document.getElementById('edit-task-assigned').value || null
+            };
+
+            try {
+                const { res, data, ok } = await apiFetch('/v1/tasks/' + id, {
+                    method: 'PATCH',
+                    headers: getHeaders(),
+                    body: JSON.stringify(body)
+                });
+                if (!ok) {
+                    throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
+                }
+                closeModal();
+                loadTasks();
+            } catch (e) {
+                alert('Error: ' + e.message);
+            }
+        }
+
         async function completeTask(id) {
             try {
-                const res = await fetch('/v1/tasks/' + id + '/complete', { method: 'POST', headers: getHeaders() });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                const { res, data, ok } = await apiFetch('/v1/tasks/' + id + '/complete', { method: 'POST', headers: getHeaders() });
+                if (!ok) throw new Error(typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail));
                 loadTasks();
             } catch (e) { alert('Error: ' + e.message); }
         }
@@ -1843,8 +2003,8 @@ CORE_OS_HTML = """<!DOCTYPE html>
             } catch (e) { alert('Error loading record'); }
         }
 
-        function viewAction(id) { viewRecord('action', id); }
-        function viewTask(id) { viewRecord('task', id); }
+        function viewAction(id) { viewActionDetail(id); }
+        function viewTask(id) { viewTaskDetail(id); }
         function viewDecision(id) { viewRecord('decision', id); }
         function viewMeeting(id) { viewRecord('meeting', id); }
         function viewFact(id) { viewRecord('memory_fact', id); }

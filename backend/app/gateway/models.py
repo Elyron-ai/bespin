@@ -412,6 +412,7 @@ class Task(Base):
     __table_args__ = (
         Index("ix_tasks_tenant_status_due", "tenant_id", "status", "due_date"),
         Index("ix_tasks_tenant_assigned_status", "tenant_id", "assigned_to_user_id", "status"),
+        Index("ix_tasks_tenant_creator_created", "tenant_id", "created_by_user_id", "created_at"),
     )
 
 
